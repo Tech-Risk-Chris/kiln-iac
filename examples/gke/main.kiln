@@ -1,0 +1,97 @@
+;; A GKE cluster with two node pools, its network, and one service identity.
+;; Build:  kiln build examples/gke/main.kiln
+;; The hand-written HCL this must match is in original/main.tf.
+
+(ns platform.gke
+  (:provider [google :as g :version "~> 6.0"]))
+
+;; ---------------------------------------------------------------- context
+;; Until contexts arrive (M4), an environment is a plain map.
+
+(def ctx
+  {:prefix  "acme"
+   :env     "dev"
+   :project "acme-dev"
+   :region  "europe-west3"
+   :pools   [{:name "default" :machine "e2-standard-4" :min 1 :max 5}
+             {:name "batch"   :machine "c3-highcpu-8"  :min 0 :max 20 :spot true}]})
+
+(provider g {:project (:project ctx) :region (:region ctx)})
+
+;; ---------------------------------------------------------------- library
+
+(defn labels [ctx extra]
+  (merge {:env (:env ctx) :managed_by "kiln"} extra))
+
+(defcomponent network [ctx {:keys [cidr]}]
+  (let [base (str (:prefix ctx) "-" (:env ctx))
+        vpc  (g/compute_network "vpc"
+               {:name base
+                :auto_create_subnetworks false})]
+    {:vpc    vpc
+     :subnet (g/compute_subnetwork "nodes"
+               {:name          (str base "-nodes")
+                :region        (:region ctx)
+                :network       (:id vpc)
+                :ip_cidr_range cidr})}))
+
+(defcomponent cluster [ctx {:keys [region network subnet pools]}]
+  (let [c (g/container_cluster "this"
+            {:name       (str (:prefix ctx) "-" (:env ctx))
+             :location   region
+             :network    (:id network)
+             :subnetwork (:id subnet)
+             :remove_default_node_pool true
+             :initial_node_count 1
+             :deletion_protection (= (:env ctx) "prod")
+             :resource_labels (labels ctx {})
+             :workload_identity_config
+             {:workload_pool (str (:project ctx) ".svc.id.goog")}})]
+    {:cluster  c
+     :endpoint (:endpoint c)
+     :pools
+     (for [p pools]
+       (g/container_node_pool (:name p)
+         {:name     (:name p)
+          :cluster  (:name c)
+          :location region
+          :autoscaling {:min_node_count (:min p)
+                        :max_node_count (:max p)}
+          :node_config {:machine_type (:machine p)
+                        :spot         (get p :spot false)
+                        :labels       (labels ctx {:pool (:name p)})}}))}))
+
+;; A team-level form: a service is a service account plus its role bindings.
+(defmacro defservice [name & {:keys [roles]}]
+  `(defcomponent ~name [ctx]
+     (let [sa (g/service_account "sa"
+                {:account_id   ~(str name)
+                 :display_name ~(str name " (" (count roles) " roles)")
+                 :project      (:project ctx)})]
+       {:sa sa
+        :bindings
+        (for [r ~roles]
+          (g/project_iam_member (slug r)
+            {:project (:project ctx)
+             :role    r
+             :member  (str "serviceAccount:" (:email sa))}))})))
+
+(defservice billing-api
+  :roles ["roles/pubsub.publisher" "roles/cloudsql.client"])
+
+;; ---------------------------------------------------------------- the stack
+
+(def net (network "net" ctx {:cidr "10.10.0.0/20"}))
+
+(def gke
+  (cluster "primary" ctx
+    {:region  (:region ctx)
+     :network (:vpc net)
+     :subnet  (:subnet net)
+     :pools   (:pools ctx)}))
+
+(def billing (billing-api "billing" ctx))
+
+(output "cluster_name" (:name (:cluster gke)))
+(output "cluster_endpoint" (:endpoint gke) {:sensitive true})
+(output "billing_service_account" (:email (:sa billing)))

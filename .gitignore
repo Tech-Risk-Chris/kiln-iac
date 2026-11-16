@@ -1,0 +1,7 @@
+/target
+.terraform/
+.kiln-check/
+*.tfstate*
+plan.bin
+# Examples are never applied; their provider locks are per-machine noise.
+examples/**/.terraform.lock.hcl

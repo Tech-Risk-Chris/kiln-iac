@@ -1,0 +1,21 @@
+;; Kiln prelude. These forms are ordinary macros: nothing here is built into
+;; the compiler.
+
+(defmacro when [test & body]
+  `(if ~test (do ~@body) nil))
+
+(defmacro when-not [test & body]
+  `(if ~test nil (do ~@body)))
+
+(defmacro cond [& clauses]
+  (if (empty? clauses)
+    nil
+    `(if ~(first clauses)
+       ~(second clauses)
+       (cond ~@(rest (rest clauses))))))
+
+;; A component is a function whose first argument is an instance name.
+;; That name becomes a segment of every address declared inside it.
+(defmacro defcomponent [name params & body]
+  `(defn ~name [instance# ~@params]
+     (scope instance# ~@body)))
