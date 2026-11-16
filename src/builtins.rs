@@ -12,7 +12,7 @@ pub const NAMES: &[&str] = &[
     "update", "zipmap", "keys", "vals", "contains?", "conj", "concat", "count", "first", "second",
     "last", "rest", "nth", "vec", "list", "range", "empty?", "nil?", "some?", "flatten", "map",
     "mapcat", "filter", "reduce", "apply", "identity", "name", "keyword", "slug", "join", "lower",
-    "upper", "fail",
+    "upper", "fail", "with-meta",
 ];
 
 fn need(name: &str, a: &[Value], n: usize) -> Res<()> {
@@ -40,6 +40,7 @@ fn to_text(v: &Value) -> Res<String> {
     Ok(match v {
         Value::Nil => String::new(),
         Value::Str(s) | Value::Symbol(s) => s.to_string(),
+        Value::Named(n) => n.name.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => fmt_float(*f),
@@ -214,6 +215,7 @@ fn merge_deep(a: &Value, b: &Value) -> Value {
 fn text_arg(name: &str, v: &Value) -> Res<String> {
     match v {
         Value::Str(s) | Value::Keyword(s) | Value::Symbol(s) => Ok(s.to_string()),
+        Value::Named(n) => Ok(n.name.clone()),
         Value::Deferred(_) => Err(KilnError::new(
             "K0316",
             format!("`{}` needs a compile-time string, got a value known only after apply", name),
@@ -559,6 +561,23 @@ pub fn call(it: &mut Interp, name: &'static str, a: Vec<Value>) -> Res<Value> {
             }
             let parts = items.iter().map(to_text_pub).collect::<Res<Vec<_>>>()?;
             Ok(Value::str(parts.join(&sep)))
+        }
+        "with-meta" => {
+            need(name, &a, 2)?;
+            let was = match &a[1] {
+                Value::Map(m) if m.len() == 1 => match map_get(m, &Value::kw("was")) {
+                    Some(Value::Str(s)) => Some(s.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match (&a[0], was) {
+                (Value::Str(s), Some(was)) => {
+                    Ok(Value::Named(Rc::new(Named { name: s.to_string(), was })))
+                }
+                _ => Err(KilnError::new("K0103", "unsupported metadata")
+                    .help("the one supported form records a rename: ^{:was \"old-name\"} \"new-name\"")),
+            }
         }
         "fail" => {
             let msg = match str_concat(&a)? {

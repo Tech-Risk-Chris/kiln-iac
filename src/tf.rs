@@ -10,7 +10,7 @@ pub fn escape_template(s: &str) -> String {
 }
 
 /// A quoted HCL string literal, for use inside an expression.
-fn hcl_quote(s: &str) -> String {
+pub fn hcl_quote(s: &str) -> String {
     let mut o = String::from("\"");
     for c in escape_template(s).chars() {
         match c {
@@ -43,6 +43,7 @@ pub fn render_expr(v: &Value) -> Res<String> {
         Value::Float(f) => format!("{}", f),
         Value::Str(s) => hcl_quote(s),
         Value::Keyword(k) => hcl_quote(k),
+        Value::Named(n) => hcl_quote(&n.name),
         Value::List(items, _) | Value::Vector(items) => {
             let parts = items.iter().map(render_expr).collect::<Res<Vec<_>>>()?;
             format!("[{}]", parts.join(", "))
@@ -126,6 +127,7 @@ fn to_json_in(v: &Value, refs: bool) -> Res<J> {
         },
         Value::Str(s) => J::String(escape_template(s)),
         Value::Keyword(k) => J::String(escape_template(k)),
+        Value::Named(n) => J::String(escape_template(&n.name)),
         Value::List(items, _) | Value::Vector(items) => {
             let mut out = vec![];
             for it in items.iter() {

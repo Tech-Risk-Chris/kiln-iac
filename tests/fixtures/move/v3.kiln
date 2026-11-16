@@ -1,0 +1,13 @@
+;; Move test, step 3: a rename that is not declared. The build must stop.
+(ns move.test
+  (:provider [random :as r :version "~> 3.6"]))
+
+(defcomponent names [{:keys [words]}]
+  {:pet (r/pet "pet" {:length words})
+   :id  (r/id "id" {:byte_length 4})})
+
+(def a (names "gamma" {:words 2}))
+
+(r/integer ^{:was "port"} "listen_port" {:min 1024 :max 2048})
+
+(output "pet" (:id (:pet a)))

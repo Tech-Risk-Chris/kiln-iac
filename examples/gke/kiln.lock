@@ -1,0 +1,14 @@
+{
+  "addresses": [
+    "google_compute_network.net__vpc",
+    "google_compute_subnetwork.net__nodes",
+    "google_container_cluster.primary__this",
+    "google_container_node_pool.primary__batch",
+    "google_container_node_pool.primary__default",
+    "google_project_iam_member.billing__roles_cloudsql_client",
+    "google_project_iam_member.billing__roles_pubsub_publisher",
+    "google_service_account.billing__sa"
+  ],
+  "moved": [],
+  "version": 1
+}

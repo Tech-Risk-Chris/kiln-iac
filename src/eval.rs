@@ -30,6 +30,9 @@ pub struct Graph {
     pub outputs: BTreeMap<String, J>,
     pub provider_cfg: BTreeMap<String, Vec<J>>,
     pub backend: Option<(String, J)>,
+    /// Declarations whose name carries `:was`: the address now, and the
+    /// addresses it may have had before.
+    pub renames: Vec<(String, Vec<String>)>,
     /// Number of declarations so far; used to detect declarations made
     /// under a deferred condition.
     pub count: usize,
@@ -39,7 +42,7 @@ pub struct Interp {
     pub global: Env,
     pub providers: BTreeMap<String, ProviderReq>,
     aliases: HashMap<String, String>,
-    scope: Vec<String>,
+    scope: Vec<(String, Option<String>)>,
     pub graph: Graph,
     gensym: u64,
     depth: u32,
@@ -56,16 +59,28 @@ fn valid_name(s: &str) -> bool {
 
 pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
     Ok(match v {
-        Value::Map(e) => map_get(e, key).unwrap_or(Value::Nil),
+        // Both spell the same Terraform key, so either finds the other.
+        Value::Map(e) => map_get(e, key)
+            .or_else(|| match key {
+                Value::Str(s) => map_get(e, &Value::Keyword(s.clone())),
+                Value::Keyword(s) => map_get(e, &Value::Str(s.clone())),
+                _ => None,
+            })
+            .unwrap_or(Value::Nil),
         Value::Nil => Value::Nil,
         Value::Vector(items) | Value::List(items, _) => match key {
             Value::Int(i) if *i >= 0 => items.get(*i as usize).cloned().unwrap_or(Value::Nil),
             _ => Value::Nil,
         },
         Value::Handle(h) => match key {
-            Value::Keyword(k) | Value::Str(k) => Value::Deferred(Rc::new(TfExpr::Attr(
+            Value::Keyword(k) => Value::Deferred(Rc::new(TfExpr::Attr(
                 Rc::new(TfExpr::Ref(h.address())),
                 k.to_string(),
+            ))),
+            // instances of a resource declared with :count or :for_each
+            Value::Int(_) | Value::Str(_) => Value::Deferred(Rc::new(TfExpr::Index(
+                Rc::new(TfExpr::Ref(h.address())),
+                key.clone(),
             ))),
             other => {
                 return fail(
@@ -121,6 +136,30 @@ fn deferred_condition(c: &Value) -> KilnError {
         "branch on a compile-time value, or declare the resource unconditionally \
          with an explicit :count meta-argument",
     )
+}
+
+impl Graph {
+    /// Every address that holds state: resources and modules, not data sources.
+    pub fn addresses(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for (ty, items) in &self.resources {
+            for name in items.keys() {
+                out.insert(format!("{}.{}", ty, name));
+            }
+        }
+        for name in self.modules.keys() {
+            out.insert(format!("module.{}", name));
+        }
+        out
+    }
+
+    pub fn body(&self, address: &str) -> Option<&J> {
+        if let Some(name) = address.strip_prefix("module.") {
+            return self.modules.get(name);
+        }
+        let (ty, name) = address.split_once('.')?;
+        self.resources.get(ty)?.get(name)
+    }
 }
 
 impl Interp {
@@ -583,7 +622,7 @@ impl Interp {
             return fail("K0102", "(output \"name\" value {options}?)");
         }
         let n = self.eval(&items[1], env)?;
-        let name = self.full_name(&self.logical_name(&n, "an output name")?);
+        let name = self.addr_names(&self.logical_name(&n, "an output name")?).0;
         let v = self.eval(&items[2], env)?;
         let mut m = JMap::new();
         if let Some(o) = items.get(3) {
@@ -623,7 +662,7 @@ impl Interp {
             return fail("K0102", "(module \"name\" {:source ... :version ...} {inputs}?)");
         }
         let n = self.eval(&items[1], env)?;
-        let name = self.full_name(&self.logical_name(&n, "a module name")?);
+        let (name, olds) = self.addr_names(&self.logical_name(&n, "a module name")?);
         let mut m = JMap::new();
         for f in &items[2..] {
             match tf::to_json(&self.eval(f, env)?)? {
@@ -637,6 +676,10 @@ impl Interp {
         let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone() };
         if self.graph.modules.insert(name, J::Object(m)).is_some() {
             return fail("K0202", format!("`{}` is declared twice", h.address()));
+        }
+        if !olds.is_empty() {
+            let olds = olds.iter().map(|o| format!("module.{}", o)).collect();
+            self.graph.renames.push((h.address(), olds));
         }
         self.graph.count += 1;
         Ok(Value::Handle(Rc::new(h)))
@@ -728,9 +771,28 @@ impl Interp {
             },
             Value::Ctor(ty) => self.declare(HandleKind::Resource, ty, &args),
             Value::TfFn(name) => match &**name {
-                "expr" => match args.first() {
-                    Some(Value::Str(s)) => Ok(Value::Deferred(Rc::new(TfExpr::Raw(s.to_string())))),
-                    _ => fail("K0103", "(tf/expr \"raw terraform expression\")"),
+                // Raw Terraform expression. Strings are expression text; any
+                // other value is rendered as an expression and spliced in.
+                "expr" => {
+                    if args.is_empty() {
+                        return fail("K0102", "(tf/expr \"raw terraform expression\" value...)");
+                    }
+                    let mut text = String::new();
+                    for a in &args {
+                        match a {
+                            Value::Str(s) => text.push_str(s),
+                            other => text.push_str(&tf::render_expr(other)?),
+                        }
+                    }
+                    Ok(Value::Deferred(Rc::new(TfExpr::Raw(text))))
+                }
+                "and" | "or" => match args.len() {
+                    2 => Ok(Value::Deferred(Rc::new(TfExpr::Bin(
+                        if &**name == "and" { "&&" } else { "||" },
+                        args[0].clone(),
+                        args[1].clone(),
+                    )))),
+                    _ => fail("K0102", "(tf/and a b) or (tf/or a b)"),
                 },
                 "if" => match args.len() {
                     3 => Ok(Value::Deferred(Rc::new(TfExpr::Cond(
@@ -879,15 +941,41 @@ impl Interp {
 
     // ------------------------------------------------------------ declarations
 
-    fn full_name(&self, name: &str) -> String {
-        if self.scope.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}__{}", self.scope.join("__"), name)
+    /// The scoped name, and every name it may have had before: one for each
+    /// way of reverting the `:was` annotations on the enclosing component
+    /// instances and on the name itself.
+    fn addr_names(&self, leaf: &(String, Option<String>)) -> (String, Vec<String>) {
+        let segs: Vec<&(String, Option<String>)> = self.scope.iter().chain(std::iter::once(leaf)).collect();
+        let join = |pick: &dyn Fn(usize) -> bool| {
+            segs.iter()
+                .enumerate()
+                .map(|(i, (name, was))| match was {
+                    Some(w) if pick(i) => w.as_str(),
+                    _ => name.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("__")
+        };
+        let current = join(&|_| false);
+        let renamed: Vec<usize> = (0..segs.len()).filter(|i| segs[*i].1.is_some()).collect();
+        let mut olds = vec![];
+        if renamed.len() <= 12 {
+            for mask in 1u32..(1u32 << renamed.len()) {
+                let old = join(&|i| renamed.iter().position(|r| *r == i).map_or(false, |b| mask & (1 << b) != 0));
+                if old != current && !olds.contains(&old) {
+                    olds.push(old);
+                }
+            }
         }
+        (current, olds)
     }
 
-    fn logical_name(&self, v: &Value, what: &str) -> Res<String> {
+    fn logical_name(&self, v: &Value, what: &str) -> Res<(String, Option<String>)> {
+        if let Value::Named(n) = v {
+            let (name, _) = self.logical_name(&Value::str(&n.name), what)?;
+            let (was, _) = self.logical_name(&Value::str(&n.was), "a :was name")?;
+            return Ok((name, Some(was)));
+        }
         let s = match v {
             Value::Str(s) | Value::Keyword(s) => s.to_string(),
             Value::Deferred(_) => {
@@ -907,14 +995,14 @@ impl Interp {
                  underscores and hyphens; (slug x) converts arbitrary text",
             ));
         }
-        Ok(s)
+        Ok((s, None))
     }
 
     fn declare(&mut self, kind: HandleKind, ty: &str, args: &[Value]) -> Res<Value> {
         if args.is_empty() || args.len() > 2 {
             return fail("K0102", format!("a declaration takes a name and a map: ({} \"name\" {{...}})", ty));
         }
-        let name = self.full_name(&self.logical_name(&args[0], "a resource name")?);
+        let (name, olds) = self.addr_names(&self.logical_name(&args[0], "a resource name")?);
         let body = match args.get(1) {
             None | Some(Value::Nil) => J::Object(JMap::new()),
             Some(m @ Value::Map(_)) => tf::to_json(m)?,
@@ -935,6 +1023,10 @@ impl Interp {
         }
         slot.insert(name, body);
         self.graph.count += 1;
+        if kind == HandleKind::Resource && !olds.is_empty() {
+            let olds = olds.iter().map(|o| format!("{}.{}", ty, o)).collect();
+            self.graph.renames.push((h.address(), olds));
+        }
         Ok(Value::Handle(Rc::new(h)))
     }
 

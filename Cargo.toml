@@ -5,6 +5,7 @@ edition = "2021"
 description = "A Lisp that compiles to Terraform JSON"
 
 [dependencies]
+hcl-rs = "0.20.0"
 serde_json = "1"
 
 [profile.release]

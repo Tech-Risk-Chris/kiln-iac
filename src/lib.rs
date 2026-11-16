@@ -3,6 +3,8 @@
 pub mod builtins;
 pub mod emit;
 pub mod eval;
+pub mod import;
+pub mod ledger;
 pub mod reader;
 pub mod tf;
 pub mod value;
@@ -13,15 +15,46 @@ fn run<T>(src: &str, file: &str, f: impl FnOnce() -> Result<T, KilnError>) -> Re
     f().map_err(|e| e.render(file, src))
 }
 
-/// Compile one stack to the text of its `main.tf.json`.
-pub fn compile(src: &str, file: &str) -> Result<String, String> {
-    run(src, file, || {
+/// The result of building one stack.
+pub struct Build {
+    /// Text of `main.tf.json`.
+    pub json: String,
+    /// Text of the updated `kiln.lock`.
+    pub lock: String,
+    /// Moves introduced by this build.
+    pub new_moves: Vec<ledger::Move>,
+}
+
+#[derive(Default)]
+pub struct BuildOpts<'a> {
+    /// The current `kiln.lock`, if there is one.
+    pub lock: Option<&'a str>,
+    /// The previously generated `main.tf.json`; used only to rank rename proposals.
+    pub old_output: Option<&'a str>,
+    /// Accept disappearing and appearing addresses as real deletions and creations.
+    pub accept_replace: bool,
+}
+
+/// Build one stack: evaluate, reconcile addresses against the ledger, emit.
+/// A pure function of its arguments.
+pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
+    let it = run(src, file, || {
         let mut it = eval::Interp::new()?;
         for form in reader::read_all(src)? {
             it.eval_toplevel(&form)?;
         }
-        Ok(emit::emit(&it, file))
-    })
+        Ok(it)
+    })?;
+    let old = opts.lock.map(ledger::Ledger::parse).transpose()?;
+    let (ledger, new_moves) =
+        ledger::reconcile(old.as_ref(), &it.graph, opts.old_output, opts.accept_replace)
+            .map_err(|m| format!("{}  --> {}\n", m, file))?;
+    Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves })
+}
+
+/// Compile one stack with no ledger to the text of its `main.tf.json`.
+pub fn compile(src: &str, file: &str) -> Result<String, String> {
+    build(src, file, &BuildOpts::default()).map(|b| b.json)
 }
 
 /// The program with every macro call expanded.

@@ -1,0 +1,14 @@
+;; Move test, step 2: a component instance and a resource are renamed, and the
+;; renames are declared. The plan must move state and change nothing.
+(ns move.test
+  (:provider [random :as r :version "~> 3.6"]))
+
+(defcomponent names [{:keys [words]}]
+  {:pet (r/pet "pet" {:length words})
+   :id  (r/id "id" {:byte_length 4})})
+
+(def a (names ^{:was "alpha"} "beta" {:words 2}))
+
+(r/integer ^{:was "port"} "listen_port" {:min 1024 :max 2048})
+
+(output "pet" (:id (:pet a)))

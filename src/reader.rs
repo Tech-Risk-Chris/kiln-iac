@@ -109,6 +109,13 @@ impl Reader {
             }
             ')' | ']' | '}' => self.err(pos, format!("unexpected `{}`", c)),
             '"' => self.read_string(),
+            '^' => {
+                // ^meta form  reads as  (with-meta form meta)
+                self.next();
+                let meta = self.read_form()?;
+                let target = self.read_form()?;
+                Ok(Value::List(Rc::new(vec![Value::sym("with-meta"), target, meta]), Some(pos)))
+            }
             '\'' => self.wrap("quote", pos),
             '`' => self.wrap("quasiquote", pos),
             '~' => {

@@ -81,6 +81,13 @@ pub enum Value {
     Handle(Rc<Handle>),
     /// A value known only after apply: a Terraform expression.
     Deferred(Rc<TfExpr>),
+    /// A logical name that records what it used to be: `^{:was "old"} "new"`.
+    Named(Rc<Named>),
+}
+
+pub struct Named {
+    pub name: String,
+    pub was: String,
 }
 
 pub struct Closure {
@@ -202,6 +209,7 @@ impl Value {
             Value::Macro(_) => "macro",
             Value::Handle(_) => "resource handle",
             Value::Deferred(_) => "deferred value",
+            Value::Named(_) => "string",
         }
     }
     pub fn sym_name(&self) -> Option<&str> {
@@ -229,6 +237,8 @@ impl PartialEq for Value {
                     && a.iter().all(|(k, v)| b.iter().any(|(k2, v2)| k == k2 && v == v2))
             }
             (Handle(a), Handle(b)) => a.address() == b.address(),
+            (Named(a), Named(b)) => a.name == b.name,
+            (Named(a), Str(b)) | (Str(b), Named(a)) => a.name == **b,
             _ => false,
         }
     }
@@ -294,6 +304,7 @@ pub fn pr_str(v: &Value) -> String {
         Value::Ctor(t) => format!("#<resource-constructor {}>", t),
         Value::TfFn(n) => format!("#<terraform-function {}>", n),
         Value::Handle(h) => format!("#<{}>", h.address()),
+        Value::Named(n) => format!("^{{:was {}}} {}", quote_str(&n.was), quote_str(&n.name)),
         Value::Deferred(e) => match crate::tf::render_tf(e) {
             Ok(s) => format!("#<deferred {}>", s),
             Err(_) => "#<deferred ?>".into(),
