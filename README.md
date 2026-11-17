@@ -6,10 +6,11 @@ you write. The generated `main.tf.json` has no dependency on Kiln.
 
 Design: [DESIGN.md](DESIGN.md). Milestones and status: [ROADMAP.md](ROADMAP.md).
 
-## Status: M2
+## Status: M2, M3 under way
 
 M0 (reader, evaluator, macros, emitter), M1 (address ledger, `moved` blocks,
-`kiln import`) and M2 (checking against provider schemas) are done.
+`kiln import`) and M2 (checking against provider schemas) are done. Of M3, secrecy
+tracking and structural recursion are done; see [ROADMAP.md](ROADMAP.md).
 
 | Done | Not yet |
 | --- | --- |
@@ -54,10 +55,14 @@ provider's schema before anything is written:
 | K0704 | wrong value type: `"1460"` for a number, a string for a set |
 | K0705 | a nested block given as something other than a map |
 | K0706 | too many or too few nested blocks |
-| K0707 | reading an attribute a resource does not have, e.g. `(:self_lnk vpc)` |
+| K0707 | reading an attribute that does not exist, e.g. `(:self_lnk vpc)`, also inside nested blocks |
+| K0708 | reading an attribute from a list or set of blocks without picking one |
 | K0711 | the cached schema's version does not satisfy the stack's constraint |
 | K0712 | no cached schema for a provider (a warning; an error with `--strict`) |
 | K0750 | a deprecated argument (a warning) |
+| K0320 | a secret flowing into an argument that is not sensitive, or into `count` / `for_each` |
+| K0321 | an output that exposes a secret without `:sensitive true` |
+| K0322 | `(secret x)` on a value written in the source |
 
 All problems are reported together, each at the declaration that caused it.
 A value that is a Terraform expression passes: its type is known only to the
@@ -134,8 +139,13 @@ it. Addresses are unchanged, so the first plan against existing state is a no-op
   function; `(tf/expr "...")` embeds a raw expression.
 - **A deferred value cannot shape the graph.** Branching on one to declare a resource,
   iterating over one, or naming a resource with one is a compile error (K0312 to K0314).
-- **No recursion, no forward references.** A definition sees only what precedes it, so
-  evaluation always terminates. Iterate with `for`, `map`, `reduce`.
+- **No forward references; only structural recursion.** A definition sees only what
+  precedes it, and a function may call itself only on a strictly smaller part of one
+  of its parameters: `(rest xs)`, a destructured part, `(:children node)`, an element.
+  Every build terminates. Counting down (`(f (- n 1))`) is not structural; use `range`.
+- **Secrets stay secret.** Reading a sensitive attribute marks the value secret, through
+  any computation. It may flow only into sensitive arguments and sensitive outputs.
+  `(tf/nonsensitive x)` declassifies on purpose.
 - **Keyword and string keys are interchangeable for lookup**: `(:a m)` finds `"a"`.
 - **Special forms:** `def defn defmacro ns` (top level only), `fn let if do for and or quote`,
   `data provider output backend module scope`. `when`, `when-not`, `cond` and
@@ -152,7 +162,8 @@ src/emit.rs       main.tf.json
 src/ledger.rs     kiln.lock: address diffing, moved blocks, rename guard
 src/import.rs     HCL -> Kiln
 src/schema.rs     schema cache, conversion, version constraints
-src/check.rs      checking declarations against schemas
+src/check.rs      checking declarations against schemas, secret flows
+src/recursion.rs  the structural recursion check
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
 examples/import-offline/  HCL fixture for the importer, credential-free providers

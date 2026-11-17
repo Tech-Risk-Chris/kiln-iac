@@ -68,6 +68,7 @@ pub fn render_expr(v: &Value) -> Res<String> {
 
 pub fn render_tf(e: &TfExpr) -> Res<String> {
     Ok(match e {
+        TfExpr::Secret(e) | TfExpr::Shaped(e, _) => render_tf(e)?,
         TfExpr::Ref(s) | TfExpr::Raw(s) => s.clone(),
         TfExpr::Attr(base, name) => format!("{}.{}", render_tf(base)?, name),
         TfExpr::Index(base, idx) => format!("{}[{}]", render_tf(base)?, render_expr(idx)?),
@@ -149,7 +150,7 @@ fn to_json_in(v: &Value, refs: bool) -> Res<J> {
             }
             J::Object(m)
         }
-        Value::Deferred(e) => match &**e {
+        Value::Deferred(e) => match e.bare() {
             TfExpr::Template(parts) => {
                 let mut o = String::new();
                 for p in parts {

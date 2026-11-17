@@ -99,6 +99,9 @@ pub struct Closure {
     pub params: Value,
     pub body: Vec<Value>,
     pub env: Env,
+    /// For a function that calls itself: the parameter that must get
+    /// structurally smaller on every recursive call.
+    pub decreasing: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,6 +139,78 @@ pub enum TfExpr {
     Not(Value),
     Cond(Value, Value, Value),
     Raw(String),
+    /// Transparent in the output: the value derives from a sensitive attribute.
+    Secret(Rc<TfExpr>),
+    /// Transparent in the output: the schema of what the expression reads,
+    /// so that further reads from it can be checked.
+    Shaped(Rc<TfExpr>, Shape),
+}
+
+#[derive(Clone)]
+pub enum Shape {
+    /// A single block (or a resource): its schema block.
+    Block(Rc<serde_json::Value>),
+    /// A collection of blocks: the element block and the nesting mode.
+    Blocks(Rc<serde_json::Value>, String),
+}
+
+impl TfExpr {
+    /// The expression without its transparent wrappers.
+    pub fn bare(&self) -> &TfExpr {
+        match self {
+            TfExpr::Secret(e) | TfExpr::Shaped(e, _) => e.bare(),
+            other => other,
+        }
+    }
+
+    pub fn is_secret_wrapped(&self) -> bool {
+        match self {
+            TfExpr::Secret(_) => true,
+            TfExpr::Shaped(e, _) => e.is_secret_wrapped(),
+            _ => false,
+        }
+    }
+
+    /// The first secret this expression is computed from, rendered.
+    pub fn secret_source(&self) -> Option<String> {
+        match self {
+            TfExpr::Secret(e) => Some(crate::tf::render_tf(e).unwrap_or_else(|_| "?".into())),
+            TfExpr::Shaped(e, _) | TfExpr::Attr(e, _) => e.secret_source(),
+            TfExpr::Index(e, v) => e.secret_source().or_else(|| secret_source(v)),
+            TfExpr::Template(parts) => parts.iter().find_map(|p| match p {
+                TplPart::Expr(e) => e.secret_source(),
+                TplPart::Lit(_) => None,
+            }),
+            // Terraform's own declassification.
+            TfExpr::Call(name, _) if name == "nonsensitive" => None,
+            TfExpr::Call(_, args) => args.iter().find_map(secret_source),
+            TfExpr::Bin(_, a, b) => secret_source(a).or_else(|| secret_source(b)),
+            TfExpr::Not(a) => secret_source(a),
+            TfExpr::Cond(c, a, b) => secret_source(c).or_else(|| secret_source(a)).or_else(|| secret_source(b)),
+            TfExpr::Ref(_) | TfExpr::Raw(_) => None,
+        }
+    }
+}
+
+/// The first secret a value is computed from, anywhere inside it.
+pub fn secret_source(v: &Value) -> Option<String> {
+    match v {
+        Value::Deferred(e) => e.secret_source(),
+        Value::List(items, _) | Value::Vector(items) => items.iter().find_map(secret_source),
+        Value::Map(entries) => entries.iter().find_map(|(k, v)| secret_source(k).or_else(|| secret_source(v))),
+        _ => None,
+    }
+}
+
+/// Structural size, the measure that recursion must decrease.
+pub fn value_size(v: &Value) -> usize {
+    match v {
+        Value::Nil => 0,
+        Value::Str(s) => 1 + s.chars().count(),
+        Value::List(items, _) | Value::Vector(items) => 1 + items.iter().map(value_size).sum::<usize>(),
+        Value::Map(entries) => 1 + entries.iter().map(|(k, v)| value_size(k) + value_size(v)).sum::<usize>(),
+        _ => 1,
+    }
 }
 
 pub enum TplPart {

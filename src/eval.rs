@@ -7,6 +7,7 @@
 use crate::builtins;
 use crate::check;
 use crate::reader;
+use crate::recursion;
 use crate::schema::{self, SchemaSet};
 use crate::tf;
 use crate::value::*;
@@ -49,6 +50,8 @@ pub struct Interp {
     pub unchecked: std::collections::BTreeSet<String>,
     version_checked: std::collections::HashSet<String>,
     pos_stack: Vec<Pos>,
+    /// Active calls of recursive functions: (function, size of its shrinking argument).
+    rec_stack: Vec<(*const Closure, usize)>,
     pub global: Env,
     pub providers: BTreeMap<String, ProviderReq>,
     aliases: HashMap<String, String>,
@@ -83,21 +86,13 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
             _ => Value::Nil,
         },
         Value::Handle(h) => match key {
-            Value::Keyword(k) if h.schema.as_ref().map_or(false, |s| !check::readable(s).contains(&&**k)) => {
-                let names = check::readable(h.schema.as_ref().unwrap());
-                let mut e = KilnError::new(
-                    "K0707",
-                    format!("{} has no attribute `{}`", h.ty, k),
-                );
-                if let Some(s) = check::suggest(k, names) {
-                    e = e.help(format!("did you mean `{}`?", s));
+            Value::Keyword(k) => {
+                let base = Rc::new(TfExpr::Ref(h.address()));
+                match &h.schema {
+                    Some(block) => read_shaped(base, &Shape::Block(block.clone()), k, &h.ty)?,
+                    None => Value::Deferred(Rc::new(TfExpr::Attr(base, k.to_string()))),
                 }
-                return Err(e);
             }
-            Value::Keyword(k) => Value::Deferred(Rc::new(TfExpr::Attr(
-                Rc::new(TfExpr::Ref(h.address())),
-                k.to_string(),
-            ))),
             // instances of a resource declared with :count or :for_each
             Value::Int(_) | Value::Str(_) => Value::Deferred(Rc::new(TfExpr::Index(
                 Rc::new(TfExpr::Ref(h.address())),
@@ -110,12 +105,20 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
                 )
             }
         },
-        Value::Deferred(e) => match key {
-            Value::Keyword(k) => Value::Deferred(Rc::new(TfExpr::Attr(e.clone(), k.to_string()))),
-            Value::Int(_) | Value::Str(_) | Value::Deferred(_) => {
+        Value::Deferred(e) => match (key, &**e) {
+            (Value::Keyword(k), TfExpr::Shaped(_, shape)) => {
+                let what = format!("`{}`", tf::render_tf(e).unwrap_or_else(|_| "the block".into()));
+                read_shaped(e.clone(), shape, k, &what)?
+            }
+            (Value::Int(_) | Value::Str(_) | Value::Deferred(_), TfExpr::Shaped(_, Shape::Blocks(block, _))) => {
+                let x = Rc::new(TfExpr::Index(e.clone(), key.clone()));
+                Value::Deferred(Rc::new(TfExpr::Shaped(x, Shape::Block(block.clone()))))
+            }
+            (Value::Keyword(k), _) => Value::Deferred(Rc::new(TfExpr::Attr(e.clone(), k.to_string()))),
+            (Value::Int(_) | Value::Str(_) | Value::Deferred(_), _) => {
                 Value::Deferred(Rc::new(TfExpr::Index(e.clone(), key.clone())))
             }
-            other => {
+            (other, _) => {
                 return fail(
                     "K0103",
                     format!("cannot index a deferred value with a {}", other.type_name()),
@@ -124,6 +127,52 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
         },
         other => return fail("K0103", format!("cannot look up a key in a {}", other.type_name())),
     })
+}
+
+/// Read `key` from something whose schema is known: check that it exists,
+/// mark it secret if the schema says it is sensitive, and keep the schema of
+/// nested blocks so that reads further down are checked too.
+fn read_shaped(base: Rc<TfExpr>, shape: &Shape, key: &str, what: &str) -> Res<Value> {
+    let block = match shape {
+        Shape::Block(b) => b,
+        Shape::Blocks(_, mode) => {
+            let help = if mode == "set" {
+                "it is a set of blocks: take one with (tf/one x), or iterate in Terraform"
+            } else {
+                "it is a list of blocks: index it first, e.g. (get x 0)"
+            };
+            return Err(KilnError::new("K0708", format!("cannot read `{}` from a collection of blocks", key)).help(help));
+        }
+    };
+    let attr_expr = Rc::new(TfExpr::Attr(base, key.to_string()));
+    if let Some(a) = block["attributes"].get(key) {
+        let mut e = attr_expr;
+        if a["sensitive"] == J::Bool(true) {
+            e = Rc::new(TfExpr::Secret(e));
+        }
+        if let Some(nt) = a.get("nested_type") {
+            let inner = Rc::new(nt.clone());
+            let s = match nt["nesting_mode"].as_str().unwrap_or("single") {
+                "single" => Shape::Block(inner),
+                m => Shape::Blocks(inner, m.to_string()),
+            };
+            e = Rc::new(TfExpr::Shaped(e, s));
+        }
+        return Ok(Value::Deferred(e));
+    }
+    if let Some(bt) = block["block_types"].get(key) {
+        let inner = Rc::new(bt["block"].clone());
+        let s = match bt["nesting_mode"].as_str().unwrap_or("list") {
+            "single" | "group" => Shape::Block(inner),
+            m => Shape::Blocks(inner, m.to_string()),
+        };
+        return Ok(Value::Deferred(Rc::new(TfExpr::Shaped(attr_expr, s))));
+    }
+    let mut e = KilnError::new("K0707", format!("{} has no attribute `{}`", what, key));
+    if let Some(s) = check::suggest(key, check::readable(block)) {
+        e = e.help(format!("did you mean `{}`?", s));
+    }
+    Err(e)
 }
 
 /// The elements of a compile-time collection. A deferred collection has no
@@ -193,6 +242,7 @@ impl Interp {
             unchecked: Default::default(),
             version_checked: Default::default(),
             pos_stack: vec![],
+            rec_stack: vec![],
             global: extend(&None, vars),
             providers: BTreeMap::new(),
             aliases: HashMap::new(),
@@ -214,17 +264,37 @@ impl Interp {
         self.toplevel_inner(form, 0).map_err(|e| e.at(pos))
     }
 
-    fn toplevel_inner(&mut self, form: &Value, n: u32) -> Res<Value> {
-        if n > MAX_EXPANSIONS {
-            return fail("K0400", "macro expansion did not terminate");
+    fn toplevel_inner(&mut self, form: &Value, _n: u32) -> Res<Value> {
+        // Expand macros at the head iteratively, so a runaway macro hits the
+        // limit instead of the stack.
+        let mut form = form.clone();
+        let mut n = 0;
+        loop {
+            let ex = match &form {
+                Value::List(items, _) => match items.first() {
+                    Some(Value::Symbol(s)) => match lookup(&self.global, s) {
+                        Some(Value::Macro(c)) => Some(self.apply_closure(&c, items[1..].to_vec())?),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            match ex {
+                Some(e) => {
+                    n += 1;
+                    if n > MAX_EXPANSIONS {
+                        return fail("K0400", "macro expansion did not terminate");
+                    }
+                    form = e;
+                }
+                None => break,
+            }
         }
+        let form = &form;
         if let Value::List(items, _) = form {
             if let Some(Value::Symbol(s)) = items.first() {
                 let bound = lookup(&self.global, s);
-                if let Some(Value::Macro(c)) = &bound {
-                    let ex = self.apply_closure(c, items[1..].to_vec())?;
-                    return self.toplevel_inner(&ex, n + 1);
-                }
                 if bound.is_none() {
                     match &**s {
                         "def" => {
@@ -238,7 +308,15 @@ impl Interp {
                             return Ok(Value::Nil);
                         }
                         "defn" | "defmacro" => {
-                            let c = self.make_named_closure(items, s)?;
+                            let mut c = self.make_named_closure(items, s)?;
+                            if &**s == "defn" {
+                                let mut body = vec![];
+                                for f in &c.body {
+                                    body.push(self.expand_all(f, 0)?);
+                                }
+                                let name = c.name.clone().unwrap();
+                                c.decreasing = recursion::decreasing_param(&name, &c.params, &body)?;
+                            }
                             let name = c.name.clone().unwrap();
                             let v = if &**s == "defn" {
                                 Value::Fn(Rc::new(c))
@@ -296,6 +374,7 @@ impl Interp {
             params: items[i].clone(),
             body: items[i + 1..].to_vec(),
             env: self.global.clone(),
+            decreasing: None,
         })
     }
 
@@ -468,6 +547,7 @@ impl Interp {
                     params: items[1].clone(),
                     body: items[2..].to_vec(),
                     env: env.clone(),
+                    decreasing: None,
                 })))
             }
             "for" => self.sf_for(items, env),
@@ -647,7 +727,8 @@ impl Interp {
         }
         let j = tf::to_json(&cfg)?;
         if let Some(ps) = self.provider_schema(&name) {
-            let issues = check::check_body(check::Kind::Provider, &ps.provider, &j);
+            let mut issues = check::check_body(check::Kind::Provider, &ps.provider, &j);
+            issues.extend(check::check_secrets(check::Kind::Provider, &ps.provider, &cfg));
             self.report(&format!("provider {}", name), issues);
         }
         self.graph.provider_cfg.entry(name).or_default().push(j);
@@ -666,6 +747,17 @@ impl Interp {
             match tf::to_json(&self.eval(o, env)?)? {
                 J::Object(o) => m = o,
                 _ => return fail("K0103", "output options must be a map"),
+            }
+        }
+        if let Some(src) = secret_source(&v) {
+            if m.get("sensitive") != Some(&J::Bool(true)) {
+                let e = KilnError::new(
+                    "K0321",
+                    format!("output `{}` exposes the secret `{}`", name, src),
+                )
+                .help("mark the output sensitive: (output \"name\" value {:sensitive true})")
+                .at(self.current_pos());
+                self.diags.push(e);
             }
         }
         m.insert("value".into(), tf::to_json(&v)?);
@@ -846,10 +938,41 @@ impl Interp {
     }
 
     pub fn apply_closure(&mut self, c: &Rc<Closure>, args: Vec<Value>) -> Res<Value> {
-        let mut vars = vec![];
+        let i = match c.decreasing {
+            None => {
+                let mut vars = vec![];
+                self.bind_params(c, args, &mut vars)?;
+                let env = extend(&c.env, vars);
+                return self.body(&c.body, &env);
+            }
+            Some(i) => i,
+        };
+        // A recursive function: it sees itself, and its shrinking argument must shrink.
+        let name = c.name.clone().unwrap();
+        let size = args.get(i).map(value_size).unwrap_or(0);
+        let me = Rc::as_ptr(c);
+        if let Some((_, prev)) = self.rec_stack.iter().rev().find(|(f, _)| *f == me) {
+            if size >= *prev {
+                return Err(KilnError::new(
+                    "K0402",
+                    format!(
+                        "`{}` called itself without its argument {} getting smaller (size {} -> {})",
+                        name,
+                        i + 1,
+                        prev,
+                        size
+                    ),
+                )
+                .help("stop the recursion when the argument is empty, e.g. (if (empty? xs) ... (f (rest xs)))"));
+            }
+        }
+        let mut vars = vec![(name, Value::Fn(c.clone()))];
         self.bind_params(c, args, &mut vars)?;
         let env = extend(&c.env, vars);
-        self.body(&c.body, &env)
+        self.rec_stack.push((me, size));
+        let r = self.body(&c.body, &env);
+        self.rec_stack.pop();
+        r
     }
 
     fn bind_params(&mut self, c: &Rc<Closure>, args: Vec<Value>, out: &mut Vec<(Rc<str>, Value)>) -> Res<()> {
@@ -1051,7 +1174,10 @@ impl Interp {
         let h = Handle { kind, ty: ty.to_string(), name: name.clone(), schema: schema.clone() };
         if let Some(block) = &schema {
             let ck = if kind == HandleKind::Data { check::Kind::Data } else { check::Kind::Resource };
-            let issues = check::check_body(ck, block, &body);
+            let mut issues = check::check_body(ck, block, &body);
+            if let Some(args) = args.get(1) {
+                issues.extend(check::check_secrets(ck, block, args));
+            }
             self.report(&h.address(), issues);
         }
         let table = match kind {

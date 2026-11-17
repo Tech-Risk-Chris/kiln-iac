@@ -7,6 +7,7 @@ pub mod eval;
 pub mod import;
 pub mod ledger;
 pub mod reader;
+pub mod recursion;
 pub mod schema;
 pub mod tf;
 pub mod value;

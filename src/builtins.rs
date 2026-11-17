@@ -12,7 +12,7 @@ pub const NAMES: &[&str] = &[
     "update", "zipmap", "keys", "vals", "contains?", "conj", "concat", "count", "first", "second",
     "last", "rest", "nth", "vec", "list", "range", "empty?", "nil?", "some?", "flatten", "map",
     "mapcat", "filter", "reduce", "apply", "identity", "name", "keyword", "slug", "join", "lower",
-    "upper", "fail", "with-meta",
+    "upper", "fail", "with-meta", "secret",
 ];
 
 fn need(name: &str, a: &[Value], n: usize) -> Res<()> {
@@ -73,12 +73,17 @@ fn str_concat(args: &[Value]) -> Res<Value> {
         match a {
             Value::Deferred(e) => {
                 any_deferred = true;
-                match &**e {
+                let secret = e.is_secret_wrapped();
+                match e.bare() {
                     TfExpr::Template(ps) => {
                         for p in ps {
                             match p {
                                 TplPart::Lit(s) => push_lit(&mut parts, s),
-                                TplPart::Expr(e) => parts.push(TplPart::Expr(e.clone())),
+                                // A template marked secret as a whole passes the mark to its parts.
+                                TplPart::Expr(x) if secret => {
+                                    parts.push(TplPart::Expr(Rc::new(TfExpr::Secret(x.clone()))))
+                                }
+                                TplPart::Expr(x) => parts.push(TplPart::Expr(x.clone())),
                             }
                         }
                     }
@@ -577,6 +582,17 @@ pub fn call(it: &mut Interp, name: &'static str, a: Vec<Value>) -> Res<Value> {
                 }
                 _ => Err(KilnError::new("K0103", "unsupported metadata")
                     .help("the one supported form records a rename: ^{:was \"old-name\"} \"new-name\"")),
+            }
+        }
+        "secret" => {
+            need(name, &a, 1)?;
+            match &a[0] {
+                Value::Deferred(e) => Ok(Value::Deferred(Rc::new(TfExpr::Secret(e.clone())))),
+                other => Err(KilnError::new(
+                    "K0322",
+                    format!("only a value known after apply can be secret, got a {}", other.type_name()),
+                )
+                .help("a secret written in the source is in the repository; read it from a secret store instead")),
             }
         }
         "fail" => {

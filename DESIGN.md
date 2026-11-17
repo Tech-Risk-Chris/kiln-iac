@@ -2,7 +2,7 @@
 
 Nov 16, 2026 · Robert C. Kahlert
 
-> Copied from the design doc of the same name. Where the implementation has diverged, this file is out of date until updated: M2 became checking against provider schemas, with static type inference moved to M3 together with staging and secrecy; M0 to M2 have no recursion at all; staging is checked during evaluation, not by types. The README has the current status.
+> Copied from the design doc of the same name. This file describes the language Kiln is heading for; [ROADMAP.md](ROADMAP.md) says what exists now. The main current departure: staging and secrecy are checked during evaluation, not yet by types.
 
 ## Thesis
 
@@ -261,14 +261,7 @@ Kiln never touches state, never speaks the provider protocol, and never runs at 
 
 ## Roadmap
 
-Six milestones, ordered so that the adoption-critical parts (output shape, address safety, import) are proven before the type system is built.
-
-1. **M0, core.** Reader, evaluator, a basic macro expander, untyped emission for one stack. Gate: a hand-written GKE example plans identically to its HCL original.
-2. **M1, address safety.** Ledger, `moved` generation, `kiln import` for a useful HCL subset. Gate: an existing client repository imports to a zero-diff plan and survives a component rename.
-3. **M2, types.** Schema-derived constructors, inference with rows, module typing. Gate: every argument error in a seeded test corpus is caught before Terraform runs.
-4. **M3, staging and secrecy.** `Deferred`, `Secret`, the explicit deferred forms. Gate: the corpus of known `for_each` and `count` plan-time failures becomes compile errors.
-5. **M4, stacks and contexts.** `defstack`, `defcontext`, `ref`, `graph.json`, `kiln run`, one CI adapter. Gate: a Terragrunt repository with three environments is replaced and its directory tree deleted.
-6. **M5, hardening.** Macro hygiene, language server, policy rules, transforms, `kiln test`, `kiln diff`. Gate: a second team adopts it without help from the authors.
+Milestones, their gates and their status are in [ROADMAP.md](ROADMAP.md).
 
 ## Decisions for v1
 

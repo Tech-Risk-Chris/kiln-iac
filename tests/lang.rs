@@ -80,9 +80,10 @@ fn user_macros_and_gensym() {
 }
 
 #[test]
-fn no_recursion_and_no_forward_references() {
+fn only_structural_recursion_and_no_forward_references() {
+    // Counting down is not structural: n - 1 is not a part of n.
     let e = eval_last("(defn f [n] (if (= n 0) 0 (f (- n 1)))) (f 3)").unwrap_err();
-    assert!(e.contains("K0100") && e.contains("unbound symbol `f`"), "{}", e);
+    assert!(e.contains("K0401"), "{}", e);
     let e = eval_last("(defn a [] (b)) (defn b [] 1) (a)").unwrap_err();
     assert!(e.contains("unbound symbol `b`"), "{}", e);
 }

@@ -5,6 +5,7 @@
 //! value types, and nested blocks with their counts. A string that is a
 //! Terraform template ("${...}") has a type only the engine knows; it passes.
 
+use crate::value::{secret_source, Value};
 use serde_json::{Map as JMap, Value as J};
 
 pub struct Issue {
@@ -414,5 +415,83 @@ pub fn readable(block: &J) -> Vec<&str> {
             out.extend(m.keys().map(|s| s.as_str()));
         }
     }
+    out
+}
+
+// ---------------------------------------------------------------- secrecy
+
+fn key_name(k: &Value) -> Option<String> {
+    match k {
+        Value::Keyword(s) | Value::Str(s) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+fn leak(path: &str, src: &str) -> Issue {
+    let mut i = issue(
+        "K0320",
+        format!("`{}` is not sensitive, but its value comes from the secret `{}`", path, src),
+    );
+    i.help = Some("if exposing it is intended, say so with (tf/nonsensitive x)".into());
+    i
+}
+
+fn secrets_in(block: &J, v: &Value, path: &str, meta: &[&str], out: &mut Vec<Issue>) {
+    let entries = match v {
+        Value::Map(e) => e,
+        Value::Vector(items) | Value::List(items, _) => {
+            for (i, item) in items.iter().enumerate() {
+                secrets_in(block, item, &format!("{}[{}]", path, i), meta, out);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for (k, val) in entries.iter() {
+        let name = match key_name(k) {
+            Some(n) => n,
+            None => continue,
+        };
+        let p = join(path, &name);
+        if meta.contains(&name.as_str()) {
+            if name == "count" || name == "for_each" {
+                if let Some(src) = secret_source(val) {
+                    out.push(issue(
+                        "K0320",
+                        format!("`{}` depends on the secret `{}`; Terraform rejects sensitive values here", p, src),
+                    ));
+                }
+            }
+            continue;
+        }
+        if let Some(a) = block["attributes"].get(&name) {
+            if a["sensitive"] == J::Bool(true) || a["write_only"] == J::Bool(true) {
+                continue;
+            }
+            match a.get("nested_type") {
+                Some(nt) if matches!(val, Value::Map(_) | Value::Vector(_) | Value::List(..)) => {
+                    secrets_in(nt, val, &p, &[], out)
+                }
+                _ => {
+                    if let Some(src) = secret_source(val) {
+                        out.push(leak(&p, &src));
+                    }
+                }
+            }
+        } else if let Some(bt) = block["block_types"].get(&name) {
+            secrets_in(&bt["block"], val, &p, &[], out);
+        }
+    }
+}
+
+/// Secrets may flow only into arguments the schema marks sensitive.
+pub fn check_secrets(kind: Kind, block: &J, args: &Value) -> Vec<Issue> {
+    let meta = match kind {
+        Kind::Resource => RESOURCE_META,
+        Kind::Data => DATA_META,
+        Kind::Provider => PROVIDER_META,
+    };
+    let mut out = vec![];
+    secrets_in(block, args, "", meta, &mut out);
     out
 }
