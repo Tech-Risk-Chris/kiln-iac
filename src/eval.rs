@@ -41,6 +41,11 @@ pub struct Graph {
     pub count: usize,
 }
 
+enum Frame {
+    Count(Value),
+    Each(u32, Value),
+}
+
 pub struct Interp {
     pub schemas: Option<Rc<SchemaSet>>,
     /// Problems found by the schema checks; reported together after evaluation.
@@ -52,6 +57,9 @@ pub struct Interp {
     pos_stack: Vec<Pos>,
     /// Active calls of recursive functions: (function, size of its shrinking argument).
     rec_stack: Vec<(*const Closure, usize)>,
+    /// Enclosing `count-deferred` and `for-each-deferred` forms.
+    inst_stack: Vec<Frame>,
+    next_each: u32,
     pub global: Env,
     pub providers: BTreeMap<String, ProviderReq>,
     aliases: HashMap<String, String>,
@@ -87,7 +95,12 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
         },
         Value::Handle(h) => match key {
             Value::Keyword(k) => {
-                let base = Rc::new(TfExpr::Ref(h.address()));
+                let base = Rc::new(match h.inst {
+                    Inst::One => TfExpr::Ref(h.address()),
+                    Inst::Count => TfExpr::Instance(h.address(), InstMode::Count),
+                    Inst::Each(id) if each_active(id) => TfExpr::Instance(h.address(), InstMode::EachKey),
+                    Inst::Each(_) => TfExpr::Instance(h.address(), InstMode::All),
+                });
                 match &h.schema {
                     Some(block) => read_shaped(base, &Shape::Block(block.clone()), k, &h.ty)?,
                     None => Value::Deferred(Rc::new(TfExpr::Attr(base, k.to_string()))),
@@ -243,6 +256,8 @@ impl Interp {
             version_checked: Default::default(),
             pos_stack: vec![],
             rec_stack: vec![],
+            inst_stack: vec![],
+            next_each: 0,
             global: extend(&None, vars),
             providers: BTreeMap::new(),
             aliases: HashMap::new(),
@@ -553,6 +568,8 @@ impl Interp {
             "for" => self.sf_for(items, env),
             "and" | "or" => self.sf_logic(name == "and", items, env),
             "scope" => self.sf_scope(items, env),
+            "count-deferred" => self.sf_count_deferred(items, env),
+            "for-each-deferred" => self.sf_for_each_deferred(items, env),
             "data" => self.sf_data(items, env),
             "provider" => self.sf_provider(items, env),
             "output" => self.sf_output(items, env),
@@ -694,6 +711,128 @@ impl Interp {
         r
     }
 
+    fn sf_count_deferred(&mut self, items: &[Value], env: &Env) -> Res<Value> {
+        if items.len() < 3 {
+            return fail("K0102", "(count-deferred condition body...)");
+        }
+        if self.inst_stack.iter().any(|f| matches!(f, Frame::Each(..))) {
+            return Err(KilnError::new("K0318", "count-deferred inside for-each-deferred")
+                .help("Terraform allows count or for_each on a resource, not both"));
+        }
+        let cond = self.eval(&items[1], env)?;
+        self.inst_stack.push(Frame::Count(cond));
+        let r = self.body(&items[2..], env);
+        self.inst_stack.pop();
+        r
+    }
+
+    fn sf_for_each_deferred(&mut self, items: &[Value], env: &Env) -> Res<Value> {
+        let (pat, coll) = match items.get(1) {
+            Some(Value::Vector(b)) if b.len() == 2 => (b[0].clone(), b[1].clone()),
+            _ => return fail("K0102", "(for-each-deferred [x collection] body...)"),
+        };
+        if let Some(f) = self.inst_stack.first() {
+            let msg = match f {
+                Frame::Each(..) => "for-each-deferred inside for-each-deferred",
+                Frame::Count(_) => "for-each-deferred inside count-deferred",
+            };
+            return Err(KilnError::new("K0318", msg).help(
+                "a resource has at most one for_each and cannot have count as well; \
+                 build the combined collection with a Terraform expression instead",
+            ));
+        }
+        let c = self.eval(&coll, env)?;
+        let each = |k: &str| Value::Deferred(Rc::new(TfExpr::Raw(format!("each.{}", k))));
+        let vars: Vec<(Rc<str>, Value)> = match &pat {
+            Value::Symbol(x) => vec![(x.clone(), each("value"))],
+            Value::Vector(kv) if kv.len() == 2 => match (&kv[0], &kv[1]) {
+                (Value::Symbol(k), Value::Symbol(v)) => vec![(k.clone(), each("key")), (v.clone(), each("value"))],
+                _ => return fail("K0103", "for-each-deferred binds a name, or [key value]"),
+            },
+            _ => return fail("K0103", "for-each-deferred binds a name, or [key value]"),
+        };
+        let id = self.next_each;
+        self.next_each += 1;
+        let env2 = extend(env, vars);
+        self.inst_stack.push(Frame::Each(id, c));
+        each_enter(id);
+        let r = self.body(&items[2..], &env2);
+        each_leave();
+        self.inst_stack.pop();
+        r
+    }
+
+    /// Add the `count` or `for_each` that enclosing forms ask for.
+    fn instancing(&mut self, body: &mut J, what: &str) -> Res<Inst> {
+        if self.inst_stack.is_empty() {
+            return Ok(Inst::One);
+        }
+        let obj = match body {
+            J::Object(o) => o,
+            _ => return Ok(Inst::One),
+        };
+        for k in ["count", "for_each"] {
+            if obj.contains_key(k) {
+                return Err(KilnError::new(
+                    "K0317",
+                    format!("{} sets :{} itself inside count-deferred or for-each-deferred", what, k),
+                )
+                .help("let the enclosing form decide, or move the declaration out of it"));
+            }
+        }
+        let mut conds = vec![];
+        let mut inst = Inst::One;
+        let mut meta = vec![];
+        for f in &self.inst_stack {
+            match f {
+                Frame::Count(c) => {
+                    conds.push(c.clone());
+                    inst = Inst::Count;
+                }
+                Frame::Each(id, coll) => {
+                    let v = match coll {
+                        Value::Vector(_) | Value::List(..) => {
+                            Value::Deferred(Rc::new(TfExpr::Call("toset".into(), vec![coll.clone()])))
+                        }
+                        Value::Map(_) | Value::Deferred(_) => coll.clone(),
+                        other => {
+                            return fail(
+                                "K0103",
+                                format!("for-each-deferred needs a map or a collection, got a {}", other.type_name()),
+                            )
+                        }
+                    };
+                    meta.push(("for_each", v));
+                    inst = Inst::Each(*id);
+                }
+            }
+        }
+        if !conds.is_empty() {
+            let v = if conds.iter().all(|c| !c.is_deferred()) {
+                Value::Int(if conds.iter().all(|c| c.truthy()) { 1 } else { 0 })
+            } else {
+                let mut test = conds.pop().unwrap();
+                while let Some(c) = conds.pop() {
+                    test = Value::Deferred(Rc::new(TfExpr::Bin("&&", c, test)));
+                }
+                Value::Deferred(Rc::new(TfExpr::Cond(test, Value::Int(1), Value::Int(0))))
+            };
+            meta.push(("count", v));
+        }
+        for (k, v) in meta {
+            if let Some(src) = secret_source(&v) {
+                let e = KilnError::new(
+                    "K0320",
+                    format!("{}: `{}` depends on the secret `{}`; Terraform rejects sensitive values here", what, k, src),
+                )
+                .at(self.current_pos());
+                self.diags.push(e);
+            }
+            obj.insert(k.to_string(), tf::to_json(&v)?);
+        }
+        Ok(inst)
+    }
+
     fn sf_data(&mut self, items: &[Value], env: &Env) -> Res<Value> {
         if items.len() < 3 {
             return fail("K0102", "(data provider/type \"name\" {args})");
@@ -802,7 +941,13 @@ impl Interp {
         if !m.contains_key("source") {
             return fail("K0103", "a module needs a :source");
         }
-        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone(), schema: None };
+        let mut body = J::Object(m);
+        let inst = self.instancing(&mut body, &format!("module.{}", name))?;
+        let m = match body {
+            J::Object(o) => o,
+            _ => unreachable!(),
+        };
+        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone(), schema: None, inst };
         if self.graph.modules.insert(name, J::Object(m)).is_some() {
             return fail("K0202", format!("`{}` is declared twice", h.address()));
         }
@@ -1170,8 +1315,14 @@ impl Interp {
                 return fail("K0103", format!("resource arguments must be a map, got a {}", other.type_name()))
             }
         };
+        let mut body = body;
+        let what = match kind {
+            HandleKind::Data => format!("data.{}.{}", ty, name),
+            _ => format!("{}.{}", ty, name),
+        };
+        let inst = self.instancing(&mut body, &what)?;
         let schema = self.type_schema(kind, ty);
-        let h = Handle { kind, ty: ty.to_string(), name: name.clone(), schema: schema.clone() };
+        let h = Handle { kind, ty: ty.to_string(), name: name.clone(), schema: schema.clone(), inst };
         if let Some(block) = &schema {
             let ck = if kind == HandleKind::Data { check::Kind::Data } else { check::Kind::Resource };
             let mut issues = check::check_body(ck, block, &body);
@@ -1322,6 +1473,10 @@ impl Interp {
                     }
                     if let Some(Value::Macro(c)) = lookup(&self.global, h) {
                         let ex = self.apply_closure(&c, items[1..].to_vec()).map_err(|e| e.at(*pos))?;
+                        let ex = match ex {
+                            Value::List(xs, None) => Value::List(xs, *pos),
+                            other => other,
+                        };
                         return self.expand_all(&ex, n + 1);
                     }
                 }

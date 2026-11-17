@@ -74,6 +74,15 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
         }
         Err(e) => fatal = Some(e),
     }
+    // Stage errors the type checker found, including in code that never ran.
+    // Where evaluation stopped on the same problem at the same place, its
+    // message names the exact address, so it wins.
+    for e in &ty.errors {
+        let same = fatal.as_ref().map_or(false, |f| f.code == e.code && f.pos == e.pos);
+        if !same {
+            errors.push(stage_error(e).render(file, src));
+        }
+    }
     // Problems found before evaluation stopped are still worth reporting.
     errors.extend(it.diags.iter().map(|e| e.render(file, src)));
     if let Some(e) = fatal {
@@ -111,6 +120,10 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves, warnings, type_clashes })
 }
 
+fn stage_error(e: &infer::StageError) -> KilnError {
+    KilnError { code: e.code, msg: e.msg.clone(), pos: e.pos, help: Some(e.help.to_string()) }
+}
+
 fn render_clashes(ty: &infer::Infer, file: &str, src: &str) -> Vec<String> {
     ty.clashes
         .iter()
@@ -122,7 +135,10 @@ fn render_clashes(ty: &infer::Infer, file: &str, src: &str) -> Vec<String> {
 /// definition, and the clashes it would report.
 pub struct TypeReport {
     pub defs: Vec<(String, String)>,
+    /// Shape clashes, not enforced yet.
     pub clashes: Vec<String>,
+    /// Stage errors, which builds enforce.
+    pub errors: Vec<String>,
 }
 
 pub fn types(src: &str, file: &str, schemas: Option<std::rc::Rc<schema::SchemaSet>>) -> Result<TypeReport, String> {
@@ -139,7 +155,8 @@ pub fn types(src: &str, file: &str, schemas: Option<std::rc::Rc<schema::SchemaSe
         }
     }
     let defs = ty.defs.iter().map(|(n, t)| (n.clone(), ty.show(t))).collect();
-    Ok(TypeReport { defs, clashes: render_clashes(&ty, file, src) })
+    let errors = ty.errors.iter().map(|e| stage_error(e).render(file, src)).collect();
+    Ok(TypeReport { defs, clashes: render_clashes(&ty, file, src), errors })
 }
 
 /// The providers a stack declares in its `ns` form: (name, source, version constraint).

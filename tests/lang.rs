@@ -4,6 +4,7 @@ fn ev(src: &str) -> String {
     let out = eval_last(src).unwrap_or_else(|e| panic!("{}", e));
     let r = kiln::types(src, "t.kiln", None).unwrap();
     assert!(r.clashes.is_empty(), "false type error in valid code:\n{}\n{}", src, r.clashes.join("\n"));
+    assert!(r.errors.is_empty(), "false stage error in valid code:\n{}\n{}", src, r.errors.join("\n"));
     out
 }
 

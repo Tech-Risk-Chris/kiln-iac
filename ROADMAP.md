@@ -7,7 +7,7 @@ Milestones are ordered so that the adoption-critical parts (output shape, addres
 | M0 Core | Done | Met: the hand-written GKE example plans identically to its HCL original |
 | M1 Address safety | Done | Met on the repository's fixtures; a real client repository is still to try |
 | M2 Schema checking | Done | Met: every mistake in a seeded corpus of 20 is caught before Terraform runs |
-| M3 Types, staging, secrecy | In progress: 4 of 7 steps | Met: deferred values that would shape the graph are compile errors, also in code that never runs |
+| M3 Types, staging, secrecy | In progress: 5 of 7 steps | Met: deferred values that would shape the graph are compile errors, also in code that never runs |
 | M4 Stacks and contexts | | |
 | M5 Hardening | | |
 
@@ -40,7 +40,7 @@ This replaced the original M2 ("types"). Checking the evaluated graph gives user
 - Structural recursion, which the type checker can verify.
 - Typed module inputs and outputs.
 
-Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, structural self-recursion, gradual shape inference, and the stage and effect analysis that meets the gate. Still to come: constructor types and static secrecy, `count-deferred` / `for-each-deferred`, typed modules.
+Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, structural self-recursion, gradual shape inference, and the stage and effect analysis that meets the gate. `count-deferred` and `for-each-deferred` hand structure the engine decides to Terraform. Still to come: constructor types and static secrecy (step 5), typed modules (step 7).
 
 **Gate:** the corpus of known `for_each` and `count` plan-time failures becomes compile errors, including in code paths that do not run. Met in `tests/m3.rs`.
 

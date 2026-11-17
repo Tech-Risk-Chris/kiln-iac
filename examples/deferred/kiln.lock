@@ -1,0 +1,10 @@
+{
+  "addresses": [
+    "google_compute_firewall.autopilot",
+    "google_compute_network.zone",
+    "google_compute_subnetwork.zone",
+    "google_container_cluster.main"
+  ],
+  "moved": [],
+  "version": 1
+}

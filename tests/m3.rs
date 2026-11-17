@@ -227,9 +227,9 @@ fn idiomatic_code_has_no_type_errors() {
     let mut bad = vec![];
     for snippet in IDIOMS {
         let src = format!("{}{}", G, snippet);
-        let c = clashes(&src);
-        if !c.is_empty() {
-            bad.push(format!("{}\n{}", snippet, c.join("\n")));
+        let r = types(&src);
+        if !r.clashes.is_empty() || !r.errors.is_empty() {
+            bad.push(format!("{}\n{}{}", snippet, r.clashes.join("\n"), r.errors.join("\n")));
         }
     }
     assert!(bad.is_empty(), "false type errors:\n\n{}", bad.join("\n\n"));
@@ -254,8 +254,9 @@ fn examples_fixtures_and_imports_have_no_type_errors() {
         sources.push((format!("import of {}", dir), kiln::import::import(&files, dir).unwrap().source));
     }
     for (name, src) in sources {
-        let c = clashes(&src);
-        assert!(c.is_empty(), "{}: false type errors:\n{}", name, c.join("\n"));
+        let r = types(&src);
+        assert!(r.clashes.is_empty(), "{}: false type errors:\n{}", name, r.clashes.join("\n"));
+        assert!(r.errors.is_empty(), "{}: false stage errors:\n{}", name, r.errors.join("\n"));
     }
 }
 
@@ -297,4 +298,237 @@ fn clashes_are_found_in_code_that_never_runs() {
         let built = build(&src, "t.kiln", &BuildOpts { schemas: Some(schemas), ..BuildOpts::default() });
         assert!(built.is_ok(), "{}: {}", snippet, built.err().unwrap());
     }
+}
+
+// ------------------------------------------------------------------ stages (step 4): the M3 gate
+
+fn stage_errors(body: &str) -> Vec<String> {
+    let src = format!("{}{}", G, body);
+    types(&src).errors
+}
+
+const CLUSTER: &str = "(def c (g/container_cluster \"c\" {:name \"c\" :location \"l\"}))\n";
+
+/// The gate: plan-time `count` and `for_each` failures, and their relatives,
+/// become compile errors, even in code that no build runs.
+const GATE: &[(&str, &str, &str)] = &[
+    // existence decided by a value known only after apply, inside a helper that is never called
+    (
+        r#"(defn maybe-net [flag] (when flag (g/compute_network "n" {:name "n"})))
+           (defn never [] (maybe-net (:enable_autopilot c)))"#,
+        "K0312",
+        "google_container_cluster.c.enable_autopilot",
+    ),
+    // the same through a function that declares
+    (
+        r#"(defn mk [] (g/compute_network "n" {:name "n"}))
+           (defn never [] (when (:enable_autopilot c) (mk)))"#,
+        "K0312",
+        "enable_autopilot",
+    ),
+    // iterating a deferred list, in a branch that is not taken
+    (r#"(def x (if false (for [z (:node_locations c)] z) []))"#, "K0313", "node_locations"),
+    // iterating it through a helper (for_each over a computed set)
+    (
+        r#"(defn nets [zones] (for [z zones] (g/compute_network z {:name z})))
+           (defn never [] (nets (:node_locations c)))"#,
+        "K0313",
+        "node_locations",
+    ),
+    // a function returning a deferred value, iterated elsewhere
+    (r#"(defn locs [] (:node_locations c)) (defn never [] (map identity (locs)))"#, "K0313", "node_locations"),
+    // count of a deferred collection
+    (r#"(defn never [] (count (:node_locations c)))"#, "K0313", "node_locations"),
+    // a filter that decides existence
+    (r#"(defn never [] (for [z ["a" "b"] :when (= z (:location c))] (g/compute_network z {:name z})))"#, "K0312", "location"),
+    // a name known only after apply
+    (r#"(defn never [] (g/compute_network (:name c) {:name "x"}))"#, "K0314", "google_container_cluster.c.name"),
+    (r#"(defcomponent net [n] (g/compute_network "v" {:name n})) (defn never [] (net (:name c) "x"))"#, "K0314", "name"),
+    // short-circuit and compile-time text functions
+    (r#"(defn never [] (and (:enable_autopilot c) 1))"#, "K0315", "enable_autopilot"),
+    (r#"(defn never [] (slug (:name c)))"#, "K0316", "name"),
+    // Terraform functions are evaluated by the engine
+    (r#"(defn never [] (for [p (tf/split "," "a,b")] p))"#, "K0313", "the Terraform function `split`"),
+];
+
+#[test]
+fn the_m3_gate_corpus_is_caught_without_running_it() {
+    let mut missed = vec![];
+    for (snippet, code, text) in GATE {
+        let errs = stage_errors(&format!("{}{}", CLUSTER, snippet));
+        let hit = errs.iter().any(|e| e.contains(&format!("error[{}]", code)) && e.contains(text));
+        if !hit {
+            missed.push(format!("{}\n  want {} mentioning {:?}, got:\n{}", snippet, code, text, errs.join("\n")));
+        }
+        // and builds now refuse it
+        let src = format!("{}{}{}", G, CLUSTER, snippet);
+        let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+        if build(&src, "t.kiln", &BuildOpts { schemas: Some(schemas), ..BuildOpts::default() }).is_ok() {
+            missed.push(format!("build accepted: {}", snippet));
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
+}
+
+#[test]
+fn stage_errors_point_at_the_sink_and_name_the_source() {
+    let src = format!(
+        "{}{}{}",
+        G,
+        CLUSTER,
+        "(defn maybe-net [flag]\n  (when flag (g/compute_network \"n\" {:name \"n\"})))\n(defn never [] (maybe-net (:enable_autopilot c)))\n"
+    );
+    let r = types(&src);
+    let e = r.errors.join("\n");
+    assert!(e.contains("t.kiln:4:3"), "the error is at the `when`:\n{}", e);
+    assert!(e.contains("(line 5, column 27)"), "and names where the value came from:\n{}", e);
+}
+
+/// Values known after apply are fine wherever they do not shape the graph.
+const VALID_STAGES: &[&str] = &[
+    // value position: a Terraform conditional
+    r#"(def label (if (:enable_autopilot c) "auto" "standard"))"#,
+    // helpers used with deferred values as plain values
+    r#"(defn label [x] (str "x-" x)) (def a (g/compute_network "n" {:name "n" :description (label (:name c))}))"#,
+    // polymorphism keeps call sites apart: static here, deferred there
+    r#"(defn pick [m] (:a m))
+       (def zs (for [z (pick {:a ["a" "b"]})] z))
+       (output "o" (pick {:a (:node_locations c)}))"#,
+    // iterating static data that contains deferred values
+    r#"(def items [{:n "a" :v (:name c)} {:n "b" :v "x"}])
+       (def nets (for [i items] (g/compute_network (:n i) {:name (:n i) :description (:v i)})))"#,
+    // conditions known at compile time decide existence
+    r#"(def env "dev") (def n (when (= env "prod") (g/compute_network "n" {:name "n"})))"#,
+    // deferred values in strings, numbers and Terraform functions
+    r#"(def mtu (+ 1 (:node_version_count c))) (def up (tf/upper (:name c)))"#,
+];
+
+#[test]
+fn deferred_values_that_do_not_shape_the_graph_are_accepted() {
+    let mut bad = vec![];
+    for snippet in VALID_STAGES {
+        let errs = stage_errors(&format!("{}{}", CLUSTER, snippet));
+        if !errs.is_empty() {
+            bad.push(format!("{}\n{}", snippet, errs.join("\n")));
+        }
+    }
+    assert!(bad.is_empty(), "false stage errors:\n\n{}", bad.join("\n\n"));
+}
+
+#[test]
+fn executed_errors_keep_their_exact_message_and_are_not_reported_twice() {
+    let src = format!("{}{}(when (:enable_autopilot c)\n  (g/compute_network \"n\" {{:name \"n\"}}))\n", G, CLUSTER);
+    let e = build(&src, "t.kiln", &BuildOpts::default()).err().unwrap();
+    assert_eq!(e.matches("error[K0312]").count(), 1, "{}", e);
+    assert!(e.contains("google_container_cluster.c.enable_autopilot"), "{}", e);
+}
+
+// ------------------------------------------------------------------ step 6: count-deferred, for-each-deferred
+
+fn json(body: &str) -> serde_json::Value {
+    let b = with_google(&format!("{}{}", CLUSTER, body)).unwrap_or_else(|e| panic!("{}", e));
+    assert!(b.type_clashes.is_empty(), "{}", b.type_clashes.join("\n"));
+    serde_json::from_str(&b.json).unwrap()
+}
+
+#[test]
+fn count_deferred_emits_count_and_reads_with_one() {
+    let j = json(
+        r#"(def fw (count-deferred (:enable_autopilot c)
+                     (g/compute_firewall "fw" {:name "fw" :network "default" :allow {:protocol "tcp"}})))
+           (output "id" (:id fw))
+           (g/compute_network "uses" {:name "u" :description (:self_link fw)})"#,
+    );
+    let fw = &j["resource"]["google_compute_firewall"]["fw"];
+    assert_eq!(fw["count"], "${(google_container_cluster.c.enable_autopilot ? 1 : 0)}");
+    assert_eq!(j["output"]["id"]["value"], "${one(google_compute_firewall.fw[*].id)}");
+    assert_eq!(j["resource"]["google_compute_network"]["uses"]["description"], "${one(google_compute_firewall.fw[*].self_link)}");
+}
+
+#[test]
+fn nested_count_deferred_conditions_are_combined() {
+    let j = json(
+        r#"(count-deferred (:enable_autopilot c)
+             (count-deferred (= (:location c) "europe-west3")
+               (g/compute_network "n" {:name "n"})))"#,
+    );
+    assert_eq!(
+        j["resource"]["google_compute_network"]["n"]["count"],
+        "${((google_container_cluster.c.enable_autopilot && (google_container_cluster.c.location == \"europe-west3\")) ? 1 : 0)}"
+    );
+}
+
+#[test]
+fn for_each_deferred_binds_each_and_keys_siblings() {
+    let j = json(
+        r#"(def subs
+             (for-each-deferred [zone (:node_locations c)]
+               (let [net (g/compute_network "z" {:name (str "net-" zone)})]
+                 (g/compute_subnetwork "z" {:name (str "sub-" zone) :network (:id net) :ip_cidr_range "10.0.0.0/24"}))))
+           (output "ids" (:id subs))"#,
+    );
+    let sub = &j["resource"]["google_compute_subnetwork"]["z"];
+    assert_eq!(sub["for_each"], "${google_container_cluster.c.node_locations}");
+    assert_eq!(sub["name"], "sub-${each.value}");
+    assert_eq!(sub["network"], "${google_compute_network.z[each.key].id}");
+    assert_eq!(j["output"]["ids"]["value"], "${{for key, r in google_compute_subnetwork.z : key => r.id}}");
+}
+
+#[test]
+fn for_each_deferred_over_a_map_binds_key_and_value() {
+    let j = json(
+        r#"(for-each-deferred [[k v] {:a "x" :b "y"}]
+             (g/compute_network "n" {:name (str k "-" v)}))
+           (for-each-deferred [z ["a" "b"]] (g/compute_network "m" {:name z}))"#,
+    );
+    let n = &j["resource"]["google_compute_network"];
+    assert_eq!(n["n"]["for_each"], serde_json::json!({"a": "x", "b": "y"}));
+    assert_eq!(n["n"]["name"], "${each.key}-${each.value}");
+    assert_eq!(n["m"]["for_each"], "${toset([\"a\", \"b\"])}");
+}
+
+#[test]
+fn components_inside_the_forms_are_instanced_too() {
+    let j = json(
+        r#"(defcomponent pair [] (g/compute_network "a" {:name "a"}) (g/compute_network "b" {:name "b"}))
+           (count-deferred (:enable_autopilot c) (pair "p"))"#,
+    );
+    for n in ["p__a", "p__b"] {
+        assert!(j["resource"]["google_compute_network"][n]["count"].is_string(), "{}", n);
+    }
+}
+
+#[test]
+fn the_forms_need_no_compile_time_condition_but_names_still_do() {
+    // no K0312/K0313: that is the point of the forms
+    let errs = stage_errors(&format!(
+        "{}{}",
+        CLUSTER,
+        r#"(defn never [] (count-deferred (:enable_autopilot c) (g/compute_network "n" {:name "n"})))
+           (defn never2 [] (for-each-deferred [z (:node_locations c)] (g/compute_network "m" {:name z})))"#
+    ));
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    // but each.value is not a name
+    let errs = stage_errors(&format!(
+        "{}{}",
+        CLUSTER,
+        r#"(defn never [] (for-each-deferred [z (:node_locations c)] (g/compute_network z {:name z})))"#
+    ));
+    assert!(errs.iter().any(|e| e.contains("K0314") && e.contains("each.value")), "{}", errs.join("\n"));
+}
+
+#[test]
+fn nesting_and_conflicts_are_refused() {
+    let e = err(&format!("{}{}", CLUSTER, r#"(for-each-deferred [a ["x"]] (for-each-deferred [b ["y"]] (g/compute_network "n" {:name "n"})))"#));
+    assert!(e.contains("K0318"), "{}", e);
+    let e = err(&format!("{}{}", CLUSTER, r#"(for-each-deferred [a ["x"]] (count-deferred true (g/compute_network "n" {:name "n"})))"#));
+    assert!(e.contains("K0318"), "{}", e);
+    let e = err(&format!("{}{}", CLUSTER, r#"(count-deferred (:enable_autopilot c) (g/compute_network "n" {:name "n" :count 2}))"#));
+    assert!(e.contains("K0317"), "{}", e);
+}
+
+#[test]
+fn a_secret_cannot_decide_count() {
+    let e = err(&format!("{}{}", SETUP, r#"(count-deferred (tf/length key) (g/compute_network "n" {:name "n"}))"#));
+    assert!(e.contains("K0320") && e.contains("`count` depends on the secret"), "{}", e);
 }

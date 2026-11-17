@@ -1,0 +1,46 @@
+;; Structure decided by the engine: count-deferred and for-each-deferred.
+;; Build:  kiln build examples/deferred/main.kiln
+;;
+;; Kiln unrolls `when` and `for` at compile time, so their conditions and
+;; collections must be known then. When only the engine can know them, these
+;; two forms hand the decision to Terraform as count and for_each.
+
+(ns examples.deferred
+  (:provider [google :as g :version "~> 6.0"]))
+
+(provider g {:project "acme-dev" :region "europe-west3"})
+
+(def cluster
+  (g/container_cluster "main"
+    {:name                     "acme-dev"
+     :location                 "europe-west3"
+     :initial_node_count       1
+     :remove_default_node_pool true
+     :deletion_protection      false}))
+
+;; A firewall rule that exists only for Autopilot clusters, which the
+;; provider decides: count = enable_autopilot ? 1 : 0.
+(def autopilot-rule
+  (count-deferred (:enable_autopilot cluster)
+    (g/compute_firewall "autopilot"
+      {:name    "acme-dev-autopilot"
+       :network "default"
+       :allow   {:protocol "tcp" :ports ["443" "10250"]}})))
+
+;; One network and subnetwork per node location, a set known after apply:
+;; for_each = node_locations. Inside the block, the subnetwork refers to
+;; the network of the same zone.
+(def zone-subnets
+  (for-each-deferred [zone (:node_locations cluster)]
+    (let [net (g/compute_network "zone"
+                {:name                    (str "acme-dev-" zone)
+                 :auto_create_subnetworks false})]
+      (g/compute_subnetwork "zone"
+        {:name          (str "acme-dev-" zone "-nodes")
+         :network       (:id net)
+         :region        "europe-west3"
+         :ip_cidr_range "10.20.0.0/24"}))))
+
+;; Outside the blocks: the rule's id or null, and a map from zone to subnet id.
+(output "autopilot_rule" (:id autopilot-rule))
+(output "zone_subnets" (:id zone-subnets))

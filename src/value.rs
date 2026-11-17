@@ -117,6 +117,46 @@ pub struct Handle {
     pub name: String,
     /// The schema block of the type, when the provider's schema is known.
     pub schema: Option<Rc<serde_json::Value>>,
+    /// Whether it was declared with `count` or `for_each` by the engine.
+    pub inst: Inst,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Inst {
+    One,
+    /// Declared inside `count-deferred`: zero or one instance.
+    Count,
+    /// Declared inside the `for-each-deferred` block with this id.
+    Each(u32),
+}
+
+/// How a reference to an instanced resource is written.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InstMode {
+    /// `one(x[*].a)`: the attribute, or null when there is no instance.
+    Count,
+    /// `x[each.key].a`: the sibling instance, inside the same `for-each-deferred`.
+    EachKey,
+    /// `{for key, r in x : key => r.a}`: every instance, keyed.
+    All,
+}
+
+thread_local! {
+    static ACTIVE_EACH: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn each_enter(id: u32) {
+    ACTIVE_EACH.with(|a| a.borrow_mut().push(id));
+}
+
+pub fn each_leave() {
+    ACTIVE_EACH.with(|a| {
+        a.borrow_mut().pop();
+    });
+}
+
+pub fn each_active(id: u32) -> bool {
+    ACTIVE_EACH.with(|a| a.borrow().contains(&id))
 }
 
 impl Handle {
@@ -139,6 +179,8 @@ pub enum TfExpr {
     Not(Value),
     Cond(Value, Value, Value),
     Raw(String),
+    /// A reference to an instanced resource; see `InstMode`.
+    Instance(String, InstMode),
     /// Transparent in the output: the value derives from a sensitive attribute.
     Secret(Rc<TfExpr>),
     /// Transparent in the output: the schema of what the expression reads,
@@ -187,7 +229,7 @@ impl TfExpr {
             TfExpr::Bin(_, a, b) => secret_source(a).or_else(|| secret_source(b)),
             TfExpr::Not(a) => secret_source(a),
             TfExpr::Cond(c, a, b) => secret_source(c).or_else(|| secret_source(a)).or_else(|| secret_source(b)),
-            TfExpr::Ref(_) | TfExpr::Raw(_) => None,
+            TfExpr::Ref(_) | TfExpr::Raw(_) | TfExpr::Instance(..) => None,
         }
     }
 }

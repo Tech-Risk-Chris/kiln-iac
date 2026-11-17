@@ -66,8 +66,34 @@ pub fn render_expr(v: &Value) -> Res<String> {
     })
 }
 
-pub fn render_tf(e: &TfExpr) -> Res<String> {
+/// A reference that starts at an instanced resource: its address, how it is
+/// instanced, and the traversal after it.
+fn instance_path(e: &TfExpr) -> Res<Option<(String, InstMode, String)>> {
     Ok(match e {
+        TfExpr::Secret(x) | TfExpr::Shaped(x, _) => instance_path(x)?,
+        TfExpr::Instance(addr, mode) => Some((addr.clone(), *mode, String::new())),
+        TfExpr::Attr(base, k) => instance_path(base)?.map(|(a, m, s)| (a, m, format!("{}.{}", s, k))),
+        TfExpr::Index(base, idx) => match instance_path(base)? {
+            Some((a, m, s)) => Some((a, m, format!("{}[{}]", s, render_expr(idx)?))),
+            None => None,
+        },
+        _ => None,
+    })
+}
+
+pub fn render_tf(e: &TfExpr) -> Res<String> {
+    if matches!(e, TfExpr::Attr(..) | TfExpr::Index(..) | TfExpr::Instance(..)) {
+        if let Some((addr, mode, suffix)) = instance_path(e)? {
+            return Ok(match mode {
+                InstMode::Count => format!("one({}[*]{})", addr, suffix),
+                InstMode::EachKey => format!("{}[each.key]{}", addr, suffix),
+                InstMode::All if suffix.is_empty() => addr,
+                InstMode::All => format!("{{for key, r in {} : key => r{}}}", addr, suffix),
+            });
+        }
+    }
+    Ok(match e {
+        TfExpr::Instance(addr, _) => addr.clone(),
         TfExpr::Secret(e) | TfExpr::Shaped(e, _) => render_tf(e)?,
         TfExpr::Ref(s) | TfExpr::Raw(s) => s.clone(),
         TfExpr::Attr(base, name) => format!("{}.{}", render_tf(base)?, name),

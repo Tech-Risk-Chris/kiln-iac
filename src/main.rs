@@ -31,8 +31,8 @@ USAGE:
               it. Addresses are preserved.
     mv        Declare that a resource was renamed; the next build emits a `moved` block.
     expand    Print the program with all macros expanded.
-    types     Print the inferred type of every top-level definition, and the type
-              errors the checker would report (it does not report them yet).
+    types     Print the inferred type of every top-level definition, stage errors,
+              and the shape errors the checker would report (not enforced yet).
 ";
 
 fn read(p: &Path) -> Result<String, String> {
@@ -320,6 +320,9 @@ fn real_main(args: Vec<String>) -> Result<(), String> {
             let width = r.defs.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
             for (n, t) in &r.defs {
                 println!("{:width$}  {}", n, t, width = width);
+            }
+            for e in &r.errors {
+                print!("\n{}", e);
             }
             if !r.clashes.is_empty() {
                 println!("\n{} type error{} the checker would report:\n", r.clashes.len(), if r.clashes.len() == 1 { "" } else { "s" });

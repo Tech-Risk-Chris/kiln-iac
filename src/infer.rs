@@ -1,17 +1,26 @@
-//! Gradual shape inference (M3 step 3).
+//! Type inference (M3): gradual shapes, sound stages.
 //!
-//! Each top-level form is macro-expanded and its shape inferred before it is
-//! evaluated. Shapes are gradual: `?` is consistent with every type, and where
-//! inference cannot be precise it yields `?` instead of failing. A definite
-//! clash (a string where a number is required, a call with the wrong number
-//! of arguments) is recorded. In this step nothing is reported to users; the
-//! clashes are collected so that the checker can be shown to accept all
-//! existing code before it is allowed to reject any.
+//! Each top-level form is macro-expanded and inferred before it is evaluated.
+//!
+//! **Shapes** are gradual. `?` is consistent with every type, and where
+//! inference cannot be precise it yields `?` instead of failing. Definite
+//! shape clashes are collected but not yet reported.
+//!
+//! **Stages** are sound. Every shape carries a node of a constraint graph,
+//! and so does every function's effect. Edges say "flows into". Sources are
+//! values known only after apply (resource attributes, Terraform functions)
+//! and declarations; sinks are the places that must be known at compile time
+//! (conditions that decide whether resources exist, collections that are
+//! iterated, names). A source that reaches a sink is an error, reported at
+//! the sink with the source it came from, whether or not any build runs
+//! that code. Top-level definitions are generalised together with the part
+//! of the graph that concerns them, so a helper used once with a static and
+//! once with a deferred value is judged at each call.
 
 use crate::eval::Interp;
 use crate::value::*;
 use serde_json::Value as J;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 pub type Fields = BTreeMap<String, (Ty, bool)>; // name -> (type, optional)
@@ -22,27 +31,92 @@ pub enum Tail {
     Open(u32),
 }
 
-#[derive(Clone, Debug)]
-pub enum Ty {
-    Var(u32),
-    Dyn,
-    Nil,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Prim {
     Bool,
     Num,
     Str,
     Kw,
-    Vec(Box<Ty>),
-    Map(Box<Ty>),
-    Rec(Fields, Tail),
-    Fn(Vec<Ty>, Option<Box<Ty>>, Box<Ty>),
-    /// A resource or data source handle of a Terraform type.
-    Res(String, bool),
+}
+
+/// A shape. The `u32` on most variants is its stage node in the graph; on
+/// functions it is the effect node.
+#[derive(Clone, Debug)]
+pub enum Ty {
+    Var(u32),
+    Nil,
+    Dyn(u32),
+    P(Prim, u32),
+    Vec(Box<Ty>, u32),
+    Map(Box<Ty>, u32),
+    Rec(Fields, Tail, u32),
+    Fn(Vec<Ty>, Option<Box<Ty>>, Box<Ty>, u32),
+    /// A resource or data source handle: type, data?, address if known,
+    /// instancing (0 single, 1 count-deferred, 2 for-each-deferred).
+    Res(String, bool, Option<Rc<str>>, u8),
     Module,
+}
+
+// ---------------------------------------------------------------- the graph
+
+#[derive(Clone)]
+enum Node {
+    Var,
+    /// A value known only after apply.
+    Src { desc: String, pos: Option<Pos> },
+    /// Declaring a resource.
+    Decl,
+    /// Something that must be known at compile time.
+    Sink { code: &'static str, msg: String, help: &'static str, pos: Option<Pos> },
+}
+
+#[derive(Default)]
+struct Graph {
+    nodes: Vec<Node>,
+    out: Vec<Vec<u32>>,
+}
+
+impl Graph {
+    fn add(&mut self, n: Node) -> u32 {
+        self.nodes.push(n);
+        self.out.push(vec![]);
+        self.nodes.len() as u32 - 1
+    }
+    fn edge(&mut self, a: u32, b: u32) {
+        if a != b && !self.out[a as usize].contains(&b) {
+            self.out[a as usize].push(b);
+        }
+    }
+    fn is_var(&self, n: u32) -> bool {
+        matches!(self.nodes[n as usize], Node::Var)
+    }
+    /// For every node reachable from the starts: the start it was reached from.
+    fn reach(&self, starts: &[u32]) -> HashMap<u32, u32> {
+        let mut seen = HashMap::new();
+        let mut q = VecDeque::new();
+        for &s in starts {
+            if seen.insert(s, s).is_none() {
+                q.push_back(s);
+            }
+        }
+        while let Some(n) = q.pop_front() {
+            let origin = seen[&n];
+            for &m in &self.out[n as usize] {
+                if !seen.contains_key(&m) {
+                    seen.insert(m, origin);
+                    q.push_back(m);
+                }
+            }
+        }
+        seen
+    }
 }
 
 pub struct Scheme {
     vars: Vec<u32>,
     rows: Vec<u32>,
+    anns: Vec<u32>,
+    edges: Vec<(u32, u32)>,
     ty: Ty,
 }
 
@@ -57,45 +131,133 @@ pub struct Clash {
     pub pos: Option<Pos>,
 }
 
+/// A stage error: a value known only after apply reaching a place that must
+/// be known at compile time.
+pub struct StageError {
+    pub code: &'static str,
+    pub msg: String,
+    pub help: &'static str,
+    pub pos: Option<Pos>,
+}
+
+struct Pending {
+    branch: u32,
+    cond: u32,
+    pos: Option<Pos>,
+}
+
 pub struct Infer {
     s: Subst,
+    g: Graph,
+    decl: u32,
     globals: HashMap<String, Scheme>,
     locals: Vec<(String, Ty)>,
-    /// Schema blocks of the resource types seen so far: (type, data) -> block.
     blocks: HashMap<(String, bool), Option<Rc<J>>>,
-    /// Constructor symbols resolved to Terraform types, e.g. `g/compute_network`.
     ctors: HashMap<String, String>,
     pos: Vec<Pos>,
+    effects: Vec<u32>,
+    pending: Vec<Pending>,
+    scope_depth: usize,
+    /// Enclosing count-deferred (1) and for-each-deferred (2) forms.
+    inst_frames: Vec<u8>,
+    reported: HashSet<u32>,
+    /// Sources already blamed: one error per cause, so that iterating a
+    /// deferred list does not also report each name derived from it.
+    blamed: HashSet<u32>,
     pub clashes: Vec<Clash>,
-    /// Inferred types of top-level definitions, in order.
+    pub errors: Vec<StageError>,
     pub defs: Vec<(String, Ty)>,
 }
 
 // ---------------------------------------------------------------- builtins
 
 const NUM_OPS: &[&str] = &["+", "-", "*", "/", "mod", "inc", "dec", "min", "max"];
-const BOOL_OPS: &[&str] = &["=", "not=", "<", ">", "<=", ">=", "not", "empty?", "nil?", "some?", "contains?"];
-const STR_OPS: &[&str] = &["str", "name", "slug", "lower", "upper", "join"];
+const LIFTED_BOOL: &[&str] = &["=", "not=", "<", ">", "<=", ">=", "not"];
+const STATIC_BOOL: &[&str] = &["nil?", "some?"];
+const COLLECTION_ARG: &[&str] = &[
+    "count", "first", "second", "last", "nth", "rest", "vec", "conj", "empty?", "keys", "vals", "assoc", "dissoc",
+    "select-keys", "update", "contains?", "get-in",
+];
+const COLLECTION_ARGS: &[&str] = &["concat", "merge", "merge-deep", "zipmap", "flatten"];
+const TEXT_ARG: &[&str] = &["name", "keyword", "slug", "lower", "upper"];
+
+const K0312: (&str, &str, &str) = (
+    "K0312",
+    "resource existence depends on a value known only after apply",
+    "branch on a compile-time value, or declare the resource unconditionally with an explicit :count meta-argument",
+);
+const K0313: (&str, &str, &str) = (
+    "K0313",
+    "cannot iterate over a collection known only after apply",
+    "iterate over compile-time data, or pass a :for_each meta-argument explicitly",
+);
+const K0314: (&str, &str, &str) = (
+    "K0314",
+    "a name depends on a value known only after apply",
+    "addresses are fixed at compile time; derive the name from compile-time data",
+);
+const K0315: (&str, &str, &str) = (
+    "K0315",
+    "and/or cannot short-circuit on a value known only after apply",
+    "write the condition as a Terraform expression: (tf/and a b)",
+);
+const K0316: (&str, &str, &str) = (
+    "K0316",
+    "this function needs a compile-time string, not a value known only after apply",
+    "use the Terraform function instead, e.g. (tf/lower x)",
+);
 
 fn is_builtin(name: &str) -> bool {
     crate::builtins::NAMES.contains(&name)
 }
 
+impl Default for Infer {
+    fn default() -> Self {
+        Infer::new()
+    }
+}
+
 impl Infer {
     pub fn new() -> Infer {
+        let mut g = Graph::default();
+        let decl = g.add(Node::Decl);
+        let top = g.add(Node::Var);
         Infer {
             s: Subst::default(),
+            g,
+            decl,
             globals: HashMap::new(),
             locals: vec![],
             blocks: HashMap::new(),
             ctors: HashMap::new(),
             pos: vec![],
+            effects: vec![top],
+            pending: vec![],
+            scope_depth: 0,
+            inst_frames: vec![],
+            reported: HashSet::new(),
+            blamed: HashSet::new(),
             clashes: vec![],
+            errors: vec![],
             defs: vec![],
         }
     }
 
-    // ------------------------------------------------------------ substitution
+    // ------------------------------------------------------------ nodes
+
+    fn ann(&mut self) -> u32 {
+        self.g.add(Node::Var)
+    }
+
+    fn src(&mut self, desc: String) -> u32 {
+        let pos = self.pos.last().copied();
+        self.g.add(Node::Src { desc, pos })
+    }
+
+    fn link(&mut self, a: u32, b: u32) {
+        self.g.edge(a, b);
+        self.g.edge(b, a);
+    }
 
     fn fresh(&mut self) -> Ty {
         self.s.tys.push(None);
@@ -107,21 +269,67 @@ impl Infer {
         Tail::Open(self.s.rows.len() as u32 - 1)
     }
 
+    fn prim(&mut self, p: Prim) -> Ty {
+        let a = self.ann();
+        Ty::P(p, a)
+    }
+
+    fn dyn_(&mut self) -> Ty {
+        let a = self.ann();
+        Ty::Dyn(a)
+    }
+
+    /// The stage node at the top of a type, if it has one.
+    fn top(&self, t: &Ty) -> Option<u32> {
+        match self.resolve(t) {
+            Ty::Dyn(a) | Ty::P(_, a) | Ty::Vec(_, a) | Ty::Map(_, a) | Ty::Rec(_, _, a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The stage node of a type; an unconstrained variable becomes `?`.
+    fn stage(&mut self, t: &Ty) -> u32 {
+        if let Some(a) = self.top(t) {
+            return a;
+        }
+        match self.resolve(t) {
+            Ty::Var(x) => {
+                let a = self.ann();
+                self.s.tys[x as usize] = Some(Ty::Dyn(a));
+                a
+            }
+            _ => self.ann(), // handles, functions, nil: compile-time
+        }
+    }
+
+    fn sink(&mut self, t: &Ty, k: (&'static str, &'static str, &'static str)) {
+        let a = self.stage(t);
+        let pos = self.pos.last().copied();
+        let s = self.g.add(Node::Sink { code: k.0, msg: k.1.to_string(), help: k.2, pos });
+        self.g.edge(a, s);
+    }
+
+    fn emit_decl(&mut self) {
+        let top = *self.effects.last().unwrap();
+        self.g.edge(self.decl, top);
+    }
+
+    // ------------------------------------------------------------ substitution
+
     fn resolve(&self, t: &Ty) -> Ty {
         match t {
             Ty::Var(v) => match &self.s.tys[*v as usize] {
                 Some(b) => self.resolve(b),
                 None => t.clone(),
             },
-            Ty::Rec(f, tail) => {
+            Ty::Rec(f, tail, a) => {
                 let (f, tail) = self.row(f.clone(), *tail);
-                Ty::Rec(f, tail)
+                Ty::Rec(f, tail, *a)
             }
             _ => t.clone(),
         }
     }
 
-    /// A record's fields with its tail followed as far as it is bound.
     fn row(&self, mut f: Fields, mut tail: Tail) -> (Fields, Tail) {
         let mut guard = 0;
         while let Tail::Open(r) = tail {
@@ -142,9 +350,9 @@ impl Infer {
     fn occurs(&self, v: u32, t: &Ty) -> bool {
         match self.resolve(t) {
             Ty::Var(w) => v == w,
-            Ty::Vec(e) | Ty::Map(e) => self.occurs(v, &e),
-            Ty::Rec(f, _) => f.values().any(|(t, _)| self.occurs(v, t)),
-            Ty::Fn(ps, r, ret) => {
+            Ty::Vec(e, _) | Ty::Map(e, _) => self.occurs(v, &e),
+            Ty::Rec(f, _, _) => f.values().any(|(t, _)| self.occurs(v, t)),
+            Ty::Fn(ps, r, ret, _) => {
                 ps.iter().any(|p| self.occurs(v, p)) || r.map_or(false, |r| self.occurs(v, &r)) || self.occurs(v, &ret)
             }
             _ => false,
@@ -153,64 +361,89 @@ impl Infer {
 
     // ------------------------------------------------------------ unification
 
-    fn unify(&mut self, a: &Ty, b: &Ty) -> Result<(), String> {
+    /// Unify shapes. With `link`, stage nodes at matching positions are
+    /// made equal; without, only shapes are compared (used by `join`).
+    fn unify(&mut self, a: &Ty, b: &Ty, link: bool) -> Result<(), String> {
         let (a, b) = (self.resolve(a), self.resolve(b));
+        let l = |me: &mut Self, x: u32, y: u32| {
+            if link {
+                me.link(x, y)
+            }
+        };
         match (&a, &b) {
-            (Ty::Dyn, _) | (_, Ty::Dyn) | (Ty::Nil, _) | (_, Ty::Nil) => Ok(()),
+            (Ty::Nil, _) | (_, Ty::Nil) => Ok(()),
             (Ty::Var(x), Ty::Var(y)) if x == y => Ok(()),
+            (Ty::Dyn(x), t) | (t, Ty::Dyn(x)) => {
+                if let Some(y) = self.top(t) {
+                    l(self, *x, y);
+                }
+                Ok(())
+            }
             (Ty::Var(x), t) | (t, Ty::Var(x)) => {
                 if !self.occurs(*x, t) {
                     self.s.tys[*x as usize] = Some(t.clone());
                 }
                 Ok(())
             }
-            (Ty::Bool, Ty::Bool) | (Ty::Num, Ty::Num) | (Ty::Str, Ty::Str) | (Ty::Kw, Ty::Kw) => Ok(()),
-            // Keywords become strings in Terraform.
-            (Ty::Str, Ty::Kw) | (Ty::Kw, Ty::Str) => Ok(()),
+            (Ty::P(p, x), Ty::P(q, y)) => {
+                let ok = p == q || matches!((p, q), (Prim::Str, Prim::Kw) | (Prim::Kw, Prim::Str));
+                if !ok {
+                    return Err(format!("{} where {} is expected", self.show(&a), self.show(&b)));
+                }
+                l(self, *x, *y);
+                Ok(())
+            }
             (Ty::Module, Ty::Module) => Ok(()),
-            (Ty::Vec(x), Ty::Vec(y)) | (Ty::Map(x), Ty::Map(y)) => self.unify(x, y),
-            (Ty::Rec(f, _), Ty::Map(v)) | (Ty::Map(v), Ty::Rec(f, _)) => {
+            (Ty::Vec(e1, x), Ty::Vec(e2, y)) | (Ty::Map(e1, x), Ty::Map(e2, y)) => {
+                l(self, *x, *y);
+                self.unify(e1, e2, link)
+            }
+            (Ty::Rec(f, _, x), Ty::Map(v, y)) | (Ty::Map(v, y), Ty::Rec(f, _, x)) => {
+                l(self, *x, *y);
                 for (t, _) in f.values() {
-                    self.unify(t, v)?;
+                    self.unify(t, v, link)?;
                 }
                 Ok(())
             }
-            (Ty::Rec(f1, t1), Ty::Rec(f2, t2)) => self.unify_rows(f1.clone(), *t1, f2.clone(), *t2),
-            (Ty::Res(t, d), Ty::Rec(f, _)) | (Ty::Rec(f, _), Ty::Res(t, d)) => {
+            (Ty::Rec(f1, t1, x), Ty::Rec(f2, t2, y)) => {
+                l(self, *x, *y);
+                self.unify_rows(f1.clone(), *t1, f2.clone(), *t2, link)
+            }
+            (Ty::Res(t, d, _, _), Ty::Rec(f, _, _)) | (Ty::Rec(f, _, _), Ty::Res(t, d, _, _)) => {
                 let (t, d, f) = (t.clone(), *d, f.clone());
                 for (k, (ft, _)) in f {
-                    if let Some(at) = self.res_attr(&t, d, &k) {
-                        self.unify(&ft, &at)?;
+                    if let Some(at) = self.res_attr(&t, d, &k, None) {
+                        self.unify(&ft, &at, link)?;
                     }
                 }
                 Ok(())
             }
-            (Ty::Res(x, dx), Ty::Res(y, dy)) if x == y && dx == dy => Ok(()),
+            (Ty::Res(x, dx, _, _), Ty::Res(y, dy, _, _)) if x == y && dx == dy => Ok(()),
             (Ty::Module, Ty::Rec(..)) | (Ty::Rec(..), Ty::Module) => Ok(()),
-            (Ty::Fn(p1, r1, ret1), Ty::Fn(p2, r2, ret2)) => {
-                let fixed = p1.len().min(p2.len());
-                if (p1.len() != p2.len()) && (r1.is_none() && p1.len() < p2.len() || r2.is_none() && p2.len() < p1.len()) {
+            (Ty::Fn(p1, r1, ret1, e1), Ty::Fn(p2, r2, ret2, e2)) => {
+                if p1.len() != p2.len() && (r1.is_none() && p1.len() < p2.len() || r2.is_none() && p2.len() < p1.len()) {
                     return Err(format!("functions of {} and {} arguments", p1.len(), p2.len()));
                 }
-                for i in 0..fixed {
-                    self.unify(&p1[i], &p2[i])?;
+                l(self, *e1, *e2);
+                for i in 0..p1.len().min(p2.len()) {
+                    self.unify(&p1[i], &p2[i], link)?;
                 }
-                self.unify(ret1, ret2)
+                self.unify(ret1, ret2, link)
             }
             _ => Err(format!("{} where {} is expected", self.show(&a), self.show(&b))),
         }
     }
 
-    fn unify_rows(&mut self, f1: Fields, t1: Tail, f2: Fields, t2: Tail) -> Result<(), String> {
+    fn unify_rows(&mut self, f1: Fields, t1: Tail, f2: Fields, t2: Tail, link: bool) -> Result<(), String> {
         for (k, (a, _)) in &f1 {
             if let Some((b, _)) = f2.get(k) {
-                self.unify(a, b)?;
+                self.unify(a, b, link)?;
             }
         }
         let only1: Fields = f1.iter().filter(|(k, _)| !f2.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
         let only2: Fields = f2.iter().filter(|(k, _)| !f1.contains_key(*k)).map(|(k, v)| (k.clone(), v.clone())).collect();
         if t1 == t2 && t1 != Tail::Closed && (!only1.is_empty() || !only2.is_empty()) {
-            return Ok(()); // a cycle; give up quietly
+            return Ok(());
         }
         let need = |only: &Fields, other: Tail| -> Result<(), String> {
             match (other, only.iter().find(|(_, (_, opt))| !opt)) {
@@ -233,10 +466,10 @@ impl Infer {
         Ok(())
     }
 
-    /// Unify, recording a clash on failure. The program goes on with `?`.
+    /// Unify, recording a shape clash on failure. The program goes on with `?`.
     fn expect(&mut self, found: &Ty, expected: &Ty, what: &str) {
         let snapshot = self.s.clone();
-        if let Err(e) = self.unify(found, expected) {
+        if let Err(e) = self.unify(found, expected, true) {
             self.s = snapshot;
             self.clash(format!("{}: {}", what, e));
         }
@@ -247,19 +480,75 @@ impl Infer {
         self.clashes.push(Clash { msg, pos });
     }
 
-    /// The least common shape of two types: unification if it succeeds,
-    /// otherwise records with the differing fields made optional, otherwise `?`.
+    /// A copy of a shape with fresh stage nodes.
+    fn copy_fresh(&mut self, t: &Ty) -> Ty {
+        match self.resolve(t) {
+            Ty::Dyn(_) => self.dyn_(),
+            Ty::P(p, _) => self.prim(p),
+            Ty::Vec(e, _) => {
+                let e = self.copy_fresh(&e);
+                Ty::Vec(Box::new(e), self.ann())
+            }
+            Ty::Map(e, _) => {
+                let e = self.copy_fresh(&e);
+                Ty::Map(Box::new(e), self.ann())
+            }
+            Ty::Rec(f, tail, _) => {
+                let mut g = Fields::new();
+                for (k, (t, o)) in f {
+                    let c = self.copy_fresh(&t);
+                    g.insert(k, (c, o));
+                }
+                Ty::Rec(g, tail, self.ann())
+            }
+            other => other,
+        }
+    }
+
+    /// Stage flow from one shape into another, position by position.
+    fn flow(&mut self, from: &Ty, to: &Ty) {
+        let (a, b) = (self.resolve(from), self.resolve(to));
+        if let (Some(x), Some(y)) = (self.top(&a), self.top(&b)) {
+            self.g.edge(x, y);
+        }
+        match (&a, &b) {
+            (Ty::Vec(x, _), Ty::Vec(y, _)) | (Ty::Map(x, _), Ty::Map(y, _)) => self.flow(x, y),
+            (Ty::Rec(f, _, _), Ty::Rec(g, _, _)) => {
+                for (k, (t, _)) in f {
+                    if let Some((u, _)) = g.get(k) {
+                        let (t, u) = (t.clone(), u.clone());
+                        self.flow(&t, &u);
+                    }
+                }
+            }
+            (Ty::Rec(f, _, _), Ty::Map(v, _)) => {
+                let v = (**v).clone();
+                for (t, _) in f.values() {
+                    let t = t.clone();
+                    self.flow(&t, &v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The least common shape of two types, with stage flowing from both.
     fn join(&mut self, a: &Ty, b: &Ty) -> Ty {
+        match (self.resolve(a), self.resolve(b)) {
+            (Ty::Nil, _) => return self.resolve(b),
+            (_, Ty::Nil) => return self.resolve(a),
+            _ => {}
+        }
         let snapshot = self.s.clone();
-        if self.unify(a, b).is_ok() {
-            return match self.resolve(a) {
-                Ty::Nil => self.resolve(b),
-                t => t,
-            };
+        if self.unify(a, b, false).is_ok() {
+            let r = self.copy_fresh(a);
+            self.flow(a, &r);
+            self.flow(b, &r);
+            return r;
         }
         self.s = snapshot;
-        match (self.resolve(a), self.resolve(b)) {
-            (Ty::Rec(f1, _), Ty::Rec(f2, _)) => {
+        let r = match (self.resolve(a), self.resolve(b)) {
+            (Ty::Rec(f1, _, _), Ty::Rec(f2, _, _)) => {
                 let mut out = Fields::new();
                 for (k, (t, opt)) in &f1 {
                     match f2.get(k) {
@@ -277,82 +566,103 @@ impl Infer {
                         out.insert(k.clone(), (t.clone(), true));
                     }
                 }
-                Ty::Rec(out, Tail::Closed)
+                Ty::Rec(out, Tail::Closed, self.ann())
             }
-            (Ty::Vec(x), Ty::Vec(y)) => Ty::Vec(Box::new(self.join(&x, &y))),
-            (Ty::Map(x), Ty::Map(y)) => Ty::Map(Box::new(self.join(&x, &y))),
-            _ => Ty::Dyn,
+            (Ty::Vec(x, _), Ty::Vec(y, _)) => {
+                let j = self.join(&x, &y);
+                Ty::Vec(Box::new(j), self.ann())
+            }
+            (Ty::Map(x, _), Ty::Map(y, _)) => {
+                let j = self.join(&x, &y);
+                Ty::Map(Box::new(j), self.ann())
+            }
+            _ => self.dyn_(),
+        };
+        if let Some(r_top) = self.top(&r) {
+            for t in [a, b] {
+                if let Some(x) = self.top(t) {
+                    self.g.edge(x, r_top);
+                }
+            }
         }
+        r
     }
 
     // ------------------------------------------------------------ schemas
 
-    fn shape_of_type(t: &J) -> Ty {
+    fn shape_of_type(t: &J, a: u32) -> Ty {
         match t {
             J::String(s) => match s.as_str() {
-                "string" => Ty::Str,
-                "number" => Ty::Num,
-                "bool" => Ty::Bool,
-                _ => Ty::Dyn,
+                "string" => Ty::P(Prim::Str, a),
+                "number" => Ty::P(Prim::Num, a),
+                "bool" => Ty::P(Prim::Bool, a),
+                _ => Ty::Dyn(a),
             },
-            J::Array(a) => match (a.first().and_then(|k| k.as_str()), a.get(1)) {
-                (Some("list" | "set"), Some(e)) => Ty::Vec(Box::new(Self::shape_of_type(e))),
-                (Some("map"), Some(e)) => Ty::Map(Box::new(Self::shape_of_type(e))),
+            J::Array(x) => match (x.first().and_then(|k| k.as_str()), x.get(1)) {
+                (Some("list" | "set"), Some(e)) => Ty::Vec(Box::new(Self::shape_of_type(e, a)), a),
+                (Some("map"), Some(e)) => Ty::Map(Box::new(Self::shape_of_type(e, a)), a),
                 (Some("object"), Some(J::Object(attrs))) => Ty::Rec(
-                    attrs.iter().map(|(k, v)| (k.clone(), (Self::shape_of_type(v), false))).collect(),
+                    attrs.iter().map(|(k, v)| (k.clone(), (Self::shape_of_type(v, a), false))).collect(),
                     Tail::Closed,
+                    a,
                 ),
-                _ => Ty::Vec(Box::new(Ty::Dyn)),
+                _ => Ty::Vec(Box::new(Ty::Dyn(a)), a),
             },
-            _ => Ty::Dyn,
+            _ => Ty::Dyn(a),
         }
     }
 
-    fn shape_of_block(b: &J) -> Ty {
+    fn shape_of_block(b: &J, a: u32) -> Ty {
         let mut f = Fields::new();
         if let Some(attrs) = b["attributes"].as_object() {
-            for (k, a) in attrs {
-                f.insert(k.clone(), (Self::shape_of_attr(a), false));
+            for (k, x) in attrs {
+                f.insert(k.clone(), (Self::shape_of_attr(x, a), false));
             }
         }
         if let Some(bts) = b["block_types"].as_object() {
             for (k, bt) in bts {
-                f.insert(k.clone(), (Self::shape_of_block_type(bt), false));
+                f.insert(k.clone(), (Self::shape_of_block_type(bt, a), false));
             }
         }
-        Ty::Rec(f, Tail::Closed)
+        Ty::Rec(f, Tail::Closed, a)
     }
 
-    fn shape_of_attr(a: &J) -> Ty {
-        match a.get("nested_type") {
+    fn shape_of_attr(x: &J, a: u32) -> Ty {
+        match x.get("nested_type") {
             Some(nt) => {
-                let inner = Self::shape_of_block(nt);
+                let inner = Self::shape_of_block(nt, a);
                 match nt["nesting_mode"].as_str().unwrap_or("single") {
                     "single" => inner,
-                    "map" => Ty::Map(Box::new(inner)),
-                    _ => Ty::Vec(Box::new(inner)),
+                    "map" => Ty::Map(Box::new(inner), a),
+                    _ => Ty::Vec(Box::new(inner), a),
                 }
             }
-            None => Self::shape_of_type(&a["type"]),
+            None => Self::shape_of_type(&x["type"], a),
         }
     }
 
-    fn shape_of_block_type(bt: &J) -> Ty {
-        let inner = Self::shape_of_block(&bt["block"]);
+    fn shape_of_block_type(bt: &J, a: u32) -> Ty {
+        let inner = Self::shape_of_block(&bt["block"], a);
         match bt["nesting_mode"].as_str().unwrap_or("list") {
             "single" | "group" => inner,
-            "map" => Ty::Map(Box::new(inner)),
-            _ => Ty::Vec(Box::new(inner)),
+            "map" => Ty::Map(Box::new(inner), a),
+            _ => Ty::Vec(Box::new(inner), a),
         }
     }
 
-    fn res_attr(&self, ty: &str, data: bool, k: &str) -> Option<Ty> {
-        let block = self.blocks.get(&(ty.to_string(), data))?.as_ref()?;
-        if let Some(a) = block["attributes"].get(k) {
-            return Some(Self::shape_of_attr(a));
+    /// The shape of an attribute of a resource type, all of it known only
+    /// after apply. With `desc`, a source node is made for the read.
+    fn res_attr(&mut self, ty: &str, data: bool, k: &str, desc: Option<String>) -> Option<Ty> {
+        let block = self.blocks.get(&(ty.to_string(), data))?.clone()?;
+        let a = match desc {
+            Some(d) => self.src(d),
+            None => self.ann(),
+        };
+        if let Some(x) = block["attributes"].get(k) {
+            return Some(Self::shape_of_attr(x, a));
         }
         if let Some(bt) = block["block_types"].get(k) {
-            return Some(Self::shape_of_block_type(bt));
+            return Some(Self::shape_of_block_type(bt, a));
         }
         None
     }
@@ -361,7 +671,7 @@ impl Infer {
 
     fn field(&mut self, t: &Ty, k: &str) -> Ty {
         match self.resolve(t) {
-            Ty::Rec(f, tail) => match f.get(k) {
+            Ty::Rec(f, tail, _) => match f.get(k) {
                 Some((ft, _)) => ft.clone(),
                 None => match tail {
                     Tail::Open(r) => {
@@ -372,39 +682,70 @@ impl Infer {
                         self.s.rows[r as usize] = Some((more, rest));
                         v
                     }
-                    // (:missing m) is nil, which Kiln code relies on.
                     Tail::Closed => Ty::Nil,
                 },
             },
-            Ty::Map(v) => *v,
-            Ty::Res(ty, d) => self.res_attr(&ty, d, k).unwrap_or(Ty::Dyn),
+            Ty::Map(v, _) => *v,
+            Ty::Res(ty, _, _, 2) => {
+                let s = self.src(format!("`{}` of the instances of a {}", k, ty));
+                Ty::Dyn(s)
+            }
+            Ty::Res(ty, d, name, _) => {
+                let desc = match &name {
+                    Some(n) => format!("`{}{}.{}.{}`", if d { "data." } else { "" }, ty, n, k),
+                    None => format!("`{}` of a {}", k, ty),
+                };
+                match self.res_attr(&ty, d, k, Some(desc.clone())) {
+                    Some(t) => t,
+                    None => {
+                        let s = self.src(desc);
+                        Ty::Dyn(s)
+                    }
+                }
+            }
+            Ty::Module => {
+                let s = self.src(format!("the module output `{}`", k));
+                Ty::Dyn(s)
+            }
             Ty::Var(x) => {
                 let v = self.fresh();
                 let rest = self.fresh_row();
                 let mut f = Fields::new();
                 f.insert(k.to_string(), (v.clone(), true));
-                self.s.tys[x as usize] = Some(Ty::Rec(f, rest));
+                let a = self.ann();
+                self.s.tys[x as usize] = Some(Ty::Rec(f, rest, a));
                 v
             }
-            Ty::Vec(_) | Ty::Nil => Ty::Nil,
-            Ty::Dyn | Ty::Module => Ty::Dyn,
+            Ty::Dyn(a) => {
+                let b = self.ann();
+                self.g.edge(a, b);
+                Ty::Dyn(b)
+            }
+            Ty::Vec(..) | Ty::Nil => Ty::Nil,
             other => {
                 let shown = self.show(&other);
                 self.clash(format!("cannot look up :{} in {}", k, shown));
-                Ty::Dyn
+                self.dyn_()
             }
         }
     }
 
-    /// The type of the elements of something iterated.
+    /// The type of the elements of something iterated. The collection itself
+    /// must be known at compile time.
     fn element(&mut self, t: &Ty) -> Ty {
+        self.sink(t, K0313);
         match self.resolve(t) {
-            Ty::Vec(e) => *e,
-            Ty::Map(_) | Ty::Rec(..) | Ty::Nil | Ty::Var(_) | Ty::Dyn | Ty::Module => Ty::Dyn,
+            Ty::Vec(e, _) => *e,
+            Ty::Dyn(a) => {
+                let b = self.ann();
+                self.g.edge(a, b);
+                Ty::Dyn(b)
+            }
+            Ty::Map(..) | Ty::Rec(..) | Ty::Nil | Ty::Var(_) | Ty::Module => self.dyn_(),
             other => {
                 let shown = self.show(&other);
                 self.clash(format!("{} is not a collection", shown));
-                Ty::Dyn
+                self.dyn_()
             }
         }
     }
@@ -415,8 +756,8 @@ impl Infer {
         if let Some((_, t)) = self.locals.iter().rev().find(|(n, _)| n == name) {
             return Some(t.clone());
         }
-        let (vars, rows, ty) = match self.globals.get(name) {
-            Some(sc) => (sc.vars.clone(), sc.rows.clone(), sc.ty.clone()),
+        let (vars, rows, anns, edges, ty) = match self.globals.get(name) {
+            Some(sc) => (sc.vars.clone(), sc.rows.clone(), sc.anns.clone(), sc.edges.clone(), sc.ty.clone()),
             None => return None,
         };
         let mut vm = HashMap::new();
@@ -429,78 +770,140 @@ impl Infer {
             let f = self.fresh_row();
             rm.insert(r, f);
         }
-        Some(self.instantiate(&ty, &vm, &rm))
+        let mut am = HashMap::new();
+        for a in anns {
+            let f = self.ann();
+            am.insert(a, f);
+        }
+        for (x, y) in edges {
+            let x2 = *am.get(&x).unwrap_or(&x);
+            let y2 = *am.get(&y).unwrap_or(&y);
+            self.g.edge(x2, y2);
+        }
+        Some(self.instantiate(&ty, &vm, &rm, &am))
     }
 
-    fn instantiate(&self, t: &Ty, vm: &HashMap<u32, Ty>, rm: &HashMap<u32, Tail>) -> Ty {
+    fn instantiate(&self, t: &Ty, vm: &HashMap<u32, Ty>, rm: &HashMap<u32, Tail>, am: &HashMap<u32, u32>) -> Ty {
+        let a = |x: &u32| *am.get(x).unwrap_or(x);
         match t {
             Ty::Var(v) => vm.get(v).cloned().unwrap_or_else(|| t.clone()),
-            Ty::Vec(e) => Ty::Vec(Box::new(self.instantiate(e, vm, rm))),
-            Ty::Map(e) => Ty::Map(Box::new(self.instantiate(e, vm, rm))),
-            Ty::Rec(f, tail) => Ty::Rec(
-                f.iter().map(|(k, (t, o))| (k.clone(), (self.instantiate(t, vm, rm), *o))).collect(),
+            Ty::Dyn(x) => Ty::Dyn(a(x)),
+            Ty::P(p, x) => Ty::P(*p, a(x)),
+            Ty::Vec(e, x) => Ty::Vec(Box::new(self.instantiate(e, vm, rm, am)), a(x)),
+            Ty::Map(e, x) => Ty::Map(Box::new(self.instantiate(e, vm, rm, am)), a(x)),
+            Ty::Rec(f, tail, x) => Ty::Rec(
+                f.iter().map(|(k, (t, o))| (k.clone(), (self.instantiate(t, vm, rm, am), *o))).collect(),
                 match tail {
                     Tail::Open(r) => rm.get(r).copied().unwrap_or(*tail),
                     Tail::Closed => Tail::Closed,
                 },
+                a(x),
             ),
-            Ty::Fn(ps, r, ret) => Ty::Fn(
-                ps.iter().map(|p| self.instantiate(p, vm, rm)).collect(),
-                r.as_ref().map(|r| Box::new(self.instantiate(r, vm, rm))),
-                Box::new(self.instantiate(ret, vm, rm)),
+            Ty::Fn(ps, r, ret, e) => Ty::Fn(
+                ps.iter().map(|p| self.instantiate(p, vm, rm, am)).collect(),
+                r.as_ref().map(|r| Box::new(self.instantiate(r, vm, rm, am))),
+                Box::new(self.instantiate(ret, vm, rm, am)),
+                a(e),
             ),
             other => other.clone(),
         }
     }
 
-    /// Fully resolve a type, so that it no longer refers to bound variables.
     pub fn zonk(&self, t: &Ty) -> Ty {
         match self.resolve(t) {
-            Ty::Vec(e) => Ty::Vec(Box::new(self.zonk(&e))),
-            Ty::Map(e) => Ty::Map(Box::new(self.zonk(&e))),
-            Ty::Rec(f, tail) => Ty::Rec(f.iter().map(|(k, (t, o))| (k.clone(), (self.zonk(t), *o))).collect(), tail),
-            Ty::Fn(ps, r, ret) => Ty::Fn(
+            Ty::Vec(e, a) => Ty::Vec(Box::new(self.zonk(&e)), a),
+            Ty::Map(e, a) => Ty::Map(Box::new(self.zonk(&e)), a),
+            Ty::Rec(f, tail, a) => Ty::Rec(f.iter().map(|(k, (t, o))| (k.clone(), (self.zonk(t), *o))).collect(), tail, a),
+            Ty::Fn(ps, r, ret, e) => Ty::Fn(
                 ps.iter().map(|p| self.zonk(p)).collect(),
                 r.map(|r| Box::new(self.zonk(&r))),
                 Box::new(self.zonk(&ret)),
+                e,
             ),
             t => t,
         }
     }
 
-    fn free(&self, t: &Ty, vars: &mut Vec<u32>, rows: &mut Vec<u32>) {
+    fn free(&self, t: &Ty, vars: &mut Vec<u32>, rows: &mut Vec<u32>, anns: &mut Vec<u32>) {
+        let ann = |x: u32, anns: &mut Vec<u32>| {
+            if self.g.is_var(x) && !anns.contains(&x) {
+                anns.push(x)
+            }
+        };
         match t {
             Ty::Var(v) => {
                 if !vars.contains(v) {
                     vars.push(*v)
                 }
             }
-            Ty::Vec(e) | Ty::Map(e) => self.free(e, vars, rows),
-            Ty::Rec(f, tail) => {
-                f.values().for_each(|(t, _)| self.free(t, vars, rows));
+            Ty::Dyn(a) | Ty::P(_, a) => ann(*a, anns),
+            Ty::Vec(e, a) | Ty::Map(e, a) => {
+                ann(*a, anns);
+                self.free(e, vars, rows, anns)
+            }
+            Ty::Rec(f, tail, a) => {
+                ann(*a, anns);
+                f.values().for_each(|(t, _)| self.free(t, vars, rows, anns));
                 if let Tail::Open(r) = tail {
                     if !rows.contains(r) {
                         rows.push(*r)
                     }
                 }
             }
-            Ty::Fn(ps, r, ret) => {
-                ps.iter().for_each(|p| self.free(p, vars, rows));
+            Ty::Fn(ps, r, ret, e) => {
+                ann(*e, anns);
+                ps.iter().for_each(|p| self.free(p, vars, rows, anns));
                 if let Some(r) = r {
-                    self.free(r, vars, rows);
+                    self.free(r, vars, rows, anns);
                 }
-                self.free(ret, vars, rows);
+                self.free(ret, vars, rows, anns);
             }
             _ => {}
         }
     }
 
+    /// The part of the graph a generalised type needs: edges between its
+    /// nodes, from its nodes to sinks, and from sources to its nodes, each
+    /// summarising a path through nodes private to the definition.
+    fn scheme_edges(&self, anns: &[u32]) -> Vec<(u32, u32)> {
+        let q: HashSet<u32> = anns.iter().copied().collect();
+        let mut edges = vec![];
+        let walk = |start: u32, edges: &mut Vec<(u32, u32)>, to_q_only: bool| {
+            let mut seen = HashSet::new();
+            let mut stack = vec![start];
+            while let Some(n) = stack.pop() {
+                for &m in &self.g.out[n as usize] {
+                    if !seen.insert(m) {
+                        continue;
+                    }
+                    if q.contains(&m) {
+                        edges.push((start, m));
+                    } else if self.g.is_var(m) {
+                        stack.push(m);
+                    } else if !to_q_only && matches!(self.g.nodes[m as usize], Node::Sink { .. }) {
+                        edges.push((start, m));
+                    }
+                }
+            }
+        };
+        for &a in anns {
+            walk(a, &mut edges, false);
+        }
+        for (i, n) in self.g.nodes.iter().enumerate() {
+            if matches!(n, Node::Src { .. } | Node::Decl) {
+                walk(i as u32, &mut edges, true);
+            }
+        }
+        edges
+    }
+
     fn define(&mut self, name: &str, t: &Ty) {
         let ty = self.zonk(t);
-        let (mut vars, mut rows) = (vec![], vec![]);
-        self.free(&ty, &mut vars, &mut rows);
+        let (mut vars, mut rows, mut anns) = (vec![], vec![], vec![]);
+        self.free(&ty, &mut vars, &mut rows, &mut anns);
+        let edges = self.scheme_edges(&anns);
         self.defs.push((name.to_string(), ty.clone()));
-        self.globals.insert(name.to_string(), Scheme { vars, rows, ty });
+        self.globals.insert(name.to_string(), Scheme { vars, rows, anns, edges, ty });
     }
 
     // ------------------------------------------------------------ patterns
@@ -510,15 +913,21 @@ impl Infer {
             Value::Symbol(s) if &**s != "&" => self.locals.push((s.to_string(), t)),
             Value::Vector(ps) => {
                 let elem = match self.resolve(&t) {
-                    Ty::Vec(e) => *e,
-                    _ => Ty::Dyn,
+                    Ty::Vec(e, _) => *e,
+                    Ty::Dyn(a) => {
+                        let b = self.ann();
+                        self.g.edge(a, b);
+                        Ty::Dyn(b)
+                    }
+                    _ => self.dyn_(),
                 };
                 let mut i = 0;
                 while i < ps.len() {
                     match &ps[i] {
                         Value::Symbol(s) if &**s == "&" => {
                             if let Some(p) = ps.get(i + 1) {
-                                self.bind(p, Ty::Vec(Box::new(elem.clone())));
+                                let a = self.ann();
+                                self.bind(p, Ty::Vec(Box::new(elem.clone()), a));
                             }
                             i += 2;
                         }
@@ -562,7 +971,7 @@ impl Infer {
                         p => {
                             let ft = match v {
                                 Value::Keyword(key) => self.field(&t, key),
-                                _ => Ty::Dyn,
+                                _ => self.dyn_(),
                             };
                             self.bind(p, ft);
                         }
@@ -578,22 +987,25 @@ impl Infer {
     pub fn infer(&mut self, form: &Value) -> Ty {
         match form {
             Value::Nil => Ty::Nil,
-            Value::Bool(_) => Ty::Bool,
-            Value::Int(_) | Value::Float(_) => Ty::Num,
-            Value::Str(_) | Value::Named(_) => Ty::Str,
-            Value::Keyword(_) => Ty::Kw,
-            Value::Symbol(s) => self.lookup(s).unwrap_or(Ty::Dyn),
+            Value::Bool(_) => self.prim(Prim::Bool),
+            Value::Int(_) | Value::Float(_) => self.prim(Prim::Num),
+            Value::Str(_) | Value::Named(_) => self.prim(Prim::Str),
+            Value::Keyword(_) => self.prim(Prim::Kw),
+            Value::Symbol(s) => match self.lookup(s) {
+                Some(t) => t,
+                None => self.dyn_(),
+            },
             Value::Vector(items) => {
                 let mut elem = Ty::Nil;
                 for it in items.iter() {
                     let t = self.infer(it);
                     elem = self.join(&elem, &t);
                 }
-                Ty::Vec(Box::new(match elem {
-                    Ty::Nil if !items.is_empty() => Ty::Nil,
-                    Ty::Nil => self.fresh(),
+                let elem = match elem {
+                    Ty::Nil if items.is_empty() => self.fresh(),
                     e => e,
-                }))
+                };
+                Ty::Vec(Box::new(elem), self.ann())
             }
             Value::Map(entries) => {
                 let literal = entries.iter().all(|(k, _)| matches!(k, Value::Keyword(_) | Value::Str(_)));
@@ -605,11 +1017,10 @@ impl Infer {
                             _ => unreachable!(),
                         };
                         let t = self.infer(v);
-                        // nil values are dropped from maps, so such a field is optional
                         let opt = matches!(self.resolve(&t), Ty::Nil);
                         f.insert(name, (t, opt));
                     }
-                    Ty::Rec(f, Tail::Closed)
+                    Ty::Rec(f, Tail::Closed, self.ann())
                 } else {
                     let mut vt = Ty::Nil;
                     for (k, v) in entries.iter() {
@@ -617,7 +1028,7 @@ impl Infer {
                         let t = self.infer(v);
                         vt = self.join(&vt, &t);
                     }
-                    Ty::Map(Box::new(vt))
+                    Ty::Map(Box::new(vt), self.ann())
                 }
             }
             Value::List(items, pos) if !items.is_empty() => {
@@ -630,7 +1041,7 @@ impl Infer {
                 }
                 t
             }
-            _ => Ty::Dyn,
+            _ => self.dyn_(),
         }
     }
 
@@ -653,25 +1064,46 @@ impl Infer {
         self.locals.iter().any(|(n, _)| n == name) || self.globals.contains_key(name)
     }
 
+    /// Infer with a fresh effect node, which flows into the enclosing one.
+    fn branch(&mut self, f: impl FnOnce(&mut Self) -> Ty, eff: u32) -> Ty {
+        self.effects.push(eff);
+        let t = f(self);
+        self.effects.pop();
+        let top = *self.effects.last().unwrap();
+        self.g.edge(eff, top);
+        t
+    }
+
     fn infer_list(&mut self, items: &[Value]) -> Ty {
         let head = items[0].sym_name().unwrap_or("");
-        let special = !self.shadowed(head);
-        if special {
+        if !self.shadowed(head) {
             match head {
-                "quote" | "quasiquote" => return Ty::Dyn,
+                "quote" | "quasiquote" => return self.dyn_(),
                 "if" => {
-                    if let Some(c) = items.get(1) {
-                        self.infer(c);
+                    let c = match items.get(1) {
+                        Some(c) => self.infer(c),
+                        None => Ty::Nil,
+                    };
+                    let eff = self.ann();
+                    let a = self.branch(|me| items.get(2).map(|f| me.infer(f)).unwrap_or(Ty::Nil), eff);
+                    let b = self.branch(|me| items.get(3).map(|f| me.infer(f)).unwrap_or(Ty::Nil), eff);
+                    let cs = self.stage(&c);
+                    let pos = self.pos.last().copied();
+                    self.pending.push(Pending { branch: eff, cond: cs, pos });
+                    let r = self.join(&a, &b);
+                    // a value chosen by a condition known after apply is known after apply
+                    match self.top(&r) {
+                        Some(rt) => self.g.edge(cs, rt),
+                        None => {}
                     }
-                    let a = items.get(2).map(|f| self.infer(f)).unwrap_or(Ty::Nil);
-                    let b = items.get(3).map(|f| self.infer(f)).unwrap_or(Ty::Nil);
-                    return self.join(&a, &b);
+                    return r;
                 }
                 "do" => return self.body(&items[1..]),
                 "and" | "or" => {
                     let mut t = Ty::Nil;
                     for f in &items[1..] {
                         let u = self.infer(f);
+                        self.sink(&u, K0315);
                         t = self.join(&t, &u);
                     }
                     return t;
@@ -699,7 +1131,9 @@ impl Infer {
                                 }
                                 match &pair[0] {
                                     Value::Keyword(k) if &**k == "when" => {
-                                        me.infer(&pair[1]);
+                                        let c = me.infer(&pair[1]);
+                                        // a filter decides which iterations exist
+                                        me.sink(&c, K0312);
                                     }
                                     Value::Keyword(k) if &**k == "let" => {
                                         if let Value::Vector(lb) = &pair[1] {
@@ -720,30 +1154,81 @@ impl Infer {
                             }
                         }
                         let b = me.body(&items[2..]);
-                        Ty::Vec(Box::new(b))
+                        let a = me.ann();
+                        Ty::Vec(Box::new(b), a)
                     })
                 }
                 "scope" => {
-                    items.get(1).map(|n| self.infer(n));
-                    return self.body(&items[2.min(items.len())..]);
+                    if let Some(n) = items.get(1) {
+                        let t = self.infer(n);
+                        self.sink(&t, K0314);
+                    }
+                    self.scope_depth += 1;
+                    let r = self.body(&items[2.min(items.len())..]);
+                    self.scope_depth -= 1;
+                    return r;
+                }
+                "count-deferred" => {
+                    // The condition is evaluated by the engine: no stage requirement.
+                    if let Some(c) = items.get(1) {
+                        self.infer(c);
+                    }
+                    self.inst_frames.push(1);
+                    let r = self.body(&items[2.min(items.len())..]);
+                    self.inst_frames.pop();
+                    return r;
+                }
+                "for-each-deferred" => {
+                    let (pat, coll) = match items.get(1) {
+                        Some(Value::Vector(b)) if b.len() == 2 => (b[0].clone(), b[1].clone()),
+                        _ => return self.dyn_(),
+                    };
+                    self.infer(&coll);
+                    self.inst_frames.push(2);
+                    let r = self.scoped(|me| {
+                        match &pat {
+                            Value::Symbol(x) => {
+                                let s = me.src("`each.value`".into());
+                                me.locals.push((x.to_string(), Ty::Dyn(s)));
+                            }
+                            Value::Vector(kv) => {
+                                for (p, k) in kv.iter().zip(["key", "value"]) {
+                                    if let Value::Symbol(x) = p {
+                                        let s = me.src(format!("`each.{}`", k));
+                                        me.locals.push((x.to_string(), Ty::Dyn(s)));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        me.body(&items[2..])
+                    });
+                    self.inst_frames.pop();
+                    return r;
                 }
                 "data" => {
-                    let ty = items.get(1).and_then(|c| c.sym_name()).and_then(|c| self.ctor_name(c));
-                    for a in &items[2.min(items.len())..] {
-                        self.infer(a);
-                    }
+                    let ty = items.get(1).and_then(|c| c.sym_name()).and_then(|c| self.ctors.get(c).cloned());
+                    let name = self.declaration(&items[2.min(items.len())..]);
                     return match ty {
-                        Some(t) => Ty::Res(t, true),
-                        None => Ty::Dyn,
+                        Some(t) => Ty::Res(t, true, name, self.inst_kind()),
+                        None => self.dyn_(),
                     };
                 }
                 "module" => {
-                    for a in &items[1..] {
-                        self.infer(a);
-                    }
+                    self.declaration(&items[1..]);
                     return Ty::Module;
                 }
-                "provider" | "output" | "backend" => {
+                "output" => {
+                    if let Some(n) = items.get(1) {
+                        let t = self.infer(n);
+                        self.sink(&t, K0314);
+                    }
+                    for a in &items[2.min(items.len())..] {
+                        self.infer(a);
+                    }
+                    return Ty::Nil;
+                }
+                "provider" | "backend" => {
                     for a in &items[2.min(items.len())..] {
                         self.infer(a);
                     }
@@ -753,18 +1238,23 @@ impl Infer {
                 _ => {}
             }
         }
-        // namespaced constructors and Terraform functions
         if let Some(sym) = items[0].sym_name() {
             if sym.contains('/') && !self.shadowed(sym) {
-                for a in &items[1..] {
-                    self.infer(a);
+                if let Some(f) = sym.strip_prefix("tf/") {
+                    for a in &items[1..] {
+                        self.infer(a);
+                    }
+                    if f == "expr" || f == "if" || f == "and" || f == "or" {
+                        let s = self.src(format!("the Terraform expression at line {}", self.line()));
+                        return Ty::Dyn(s);
+                    }
+                    let s = self.src(format!("the result of the Terraform function `{}`", f));
+                    return Ty::Dyn(s);
                 }
-                if sym.starts_with("tf/") {
-                    return Ty::Dyn;
-                }
-                return match self.ctor_name(sym) {
-                    Some(t) => Ty::Res(t, false),
-                    None => Ty::Dyn,
+                let name = self.declaration(&items[1..]);
+                return match self.ctors.get(sym).cloned() {
+                    Some(t) => Ty::Res(t, false, name, self.inst_kind()),
+                    None => self.dyn_(),
                 };
             }
             if is_builtin(sym) && !self.shadowed(sym) {
@@ -772,7 +1262,10 @@ impl Infer {
             }
         }
         if let Value::Keyword(k) = &items[0] {
-            let m = items.get(1).map(|f| self.infer(f)).unwrap_or(Ty::Dyn);
+            let m = match items.get(1) {
+                Some(f) => self.infer(f),
+                None => self.dyn_(),
+            };
             let v = self.field(&m, k);
             return match items.get(2) {
                 Some(d) => {
@@ -787,13 +1280,41 @@ impl Infer {
         self.apply(&f, &args, &items[0])
     }
 
+    fn inst_kind(&self) -> u8 {
+        self.inst_frames.iter().copied().max().unwrap_or(0)
+    }
+
+    fn line(&self) -> u32 {
+        self.pos.last().map_or(0, |p| p.line)
+    }
+
+    /// A declaration: its name must be known at compile time, and it is an
+    /// effect. Returns the address name when it is a literal at top level.
+    fn declaration(&mut self, args: &[Value]) -> Option<Rc<str>> {
+        let literal = match args.first() {
+            Some(Value::Str(s)) if self.scope_depth == 0 => Some(s.clone()),
+            _ => None,
+        };
+        if let Some(n) = args.first() {
+            let t = self.infer(n);
+            self.sink(&t, K0314);
+        }
+        for a in args.iter().skip(1) {
+            self.infer(a);
+        }
+        self.emit_decl();
+        literal
+    }
+
     fn apply(&mut self, f: &Ty, args: &[Ty], head: &Value) -> Ty {
         let name = match head {
             Value::Symbol(s) => format!("`{}`", s),
             _ => "this function".to_string(),
         };
+        let top = *self.effects.last().unwrap();
         match self.resolve(f) {
-            Ty::Fn(ps, rest, ret) => {
+            Ty::Fn(ps, rest, ret, eff) => {
+                self.g.edge(eff, top);
                 if args.len() < ps.len() || (rest.is_none() && args.len() > ps.len()) {
                     self.clash(format!(
                         "{} takes {}{} argument{}, got {}",
@@ -812,15 +1333,17 @@ impl Infer {
             }
             Ty::Var(x) => {
                 let ret = self.fresh();
-                self.s.tys[x as usize] = Some(Ty::Fn(args.to_vec(), None, Box::new(ret.clone())));
+                let eff = self.ann();
+                self.g.edge(eff, top);
+                self.s.tys[x as usize] = Some(Ty::Fn(args.to_vec(), None, Box::new(ret.clone()), eff));
                 ret
             }
-            Ty::Map(v) => *v,
-            Ty::Rec(..) | Ty::Dyn | Ty::Nil | Ty::Module => Ty::Dyn,
+            Ty::Map(v, _) => *v,
+            Ty::Rec(..) | Ty::Dyn(_) | Ty::Nil | Ty::Module => self.dyn_(),
             other => {
                 let shown = self.show(&other);
                 self.clash(format!("{} is not a function", shown));
-                Ty::Dyn
+                self.dyn_()
             }
         }
     }
@@ -828,13 +1351,15 @@ impl Infer {
     fn infer_fn(&mut self, name: Option<&str>, params: Option<&Value>, body: &[Value]) -> Ty {
         let pats = match params {
             Some(Value::Vector(p)) => p.clone(),
-            _ => return Ty::Dyn,
+            _ => return self.dyn_(),
         };
         let fixed_n = pats.iter().position(|p| p.sym_name() == Some("&")).unwrap_or(pats.len());
         let ps: Vec<Ty> = (0..fixed_n).map(|_| self.fresh()).collect();
-        let rest = if fixed_n < pats.len() { Some(Box::new(Ty::Dyn)) } else { None };
+        let rest = if fixed_n < pats.len() { Some(Box::new(self.dyn_())) } else { None };
         let ret = self.fresh();
-        let me_ty = Ty::Fn(ps.clone(), rest.clone(), Box::new(ret.clone()));
+        let eff = self.ann();
+        let me_ty = Ty::Fn(ps.clone(), rest.clone(), Box::new(ret.clone()), eff);
+        self.effects.push(eff);
         let body_t = self.scoped(|me| {
             if let Some(n) = name {
                 me.locals.push((n.to_string(), me_ty.clone()));
@@ -846,81 +1371,127 @@ impl Infer {
                 let rt = match rp {
                     Value::Symbol(_) => {
                         let e = me.fresh();
-                        Ty::Vec(Box::new(e))
+                        let a = me.ann();
+                        Ty::Vec(Box::new(e), a)
                     }
-                    _ => me.fresh(), // keyword arguments
+                    _ => me.fresh(),
                 };
                 me.bind(rp, rt);
             }
             me.body(body)
         });
+        self.effects.pop();
         self.expect(&body_t, &ret, "the result");
         me_ty
     }
 
+    /// The result of a lifted operation: known after apply if any argument is.
+    fn lifted(&mut self, p: Prim, ts: &[Ty]) -> Ty {
+        let r = self.ann();
+        for t in ts {
+            let a = self.stage(t);
+            self.g.edge(a, r);
+        }
+        Ty::P(p, r)
+    }
+
     fn builtin(&mut self, name: &str, args: &[Value]) -> Ty {
         let ts: Vec<Ty> = args.iter().map(|a| self.infer(a)).collect();
-        let arg = |i: usize| ts.get(i).cloned().unwrap_or(Ty::Dyn);
+        let arg = |i: usize| ts.get(i).cloned().unwrap_or(Ty::Nil);
         if NUM_OPS.contains(&name) {
             for (i, t) in ts.iter().enumerate() {
-                self.expect(t, &Ty::Num, &format!("argument {} of `{}`", i + 1, name));
+                let n = self.prim(Prim::Num);
+                self.expect(t, &n, &format!("argument {} of `{}`", i + 1, name));
             }
-            return Ty::Num;
+            return self.lifted(Prim::Num, &ts);
         }
-        if BOOL_OPS.contains(&name) {
-            return Ty::Bool;
+        if LIFTED_BOOL.contains(&name) {
+            return self.lifted(Prim::Bool, &ts);
         }
-        if STR_OPS.contains(&name) {
-            return Ty::Str;
+        if STATIC_BOOL.contains(&name) {
+            return self.prim(Prim::Bool);
+        }
+        if name == "str" {
+            return self.lifted(Prim::Str, &ts);
+        }
+        if name == "join" {
+            if let Some(sep) = ts.first() {
+                self.sink(sep, K0316);
+            }
+            return self.lifted(Prim::Str, &ts);
+        }
+        if TEXT_ARG.contains(&name) {
+            if let Some(t) = ts.first() {
+                self.sink(t, K0316);
+            }
+            return if name == "keyword" { self.prim(Prim::Kw) } else { self.prim(Prim::Str) };
+        }
+        if COLLECTION_ARG.contains(&name) {
+            if let Some(t) = ts.first() {
+                self.sink(t, K0313);
+            }
+        }
+        if COLLECTION_ARGS.contains(&name) {
+            for t in &ts {
+                self.sink(t, K0313);
+            }
         }
         match name {
             "count" => {
                 if let Some(t) = ts.first() {
-                    if !matches!(self.resolve(t), Ty::Str) {
+                    if !matches!(self.resolve(t), Ty::P(Prim::Str, _)) {
                         self.element(t);
                     }
                 }
-                Ty::Num
+                self.prim(Prim::Num)
             }
             "first" | "second" | "last" | "nth" => self.element(&arg(0)),
             "rest" | "vec" => {
                 let e = self.element(&arg(0));
-                Ty::Vec(Box::new(e))
+                Ty::Vec(Box::new(e), self.ann())
             }
             "conj" => {
                 let mut e = self.element(&arg(0));
                 for t in ts.iter().skip(1) {
                     e = self.join(&e, t);
                 }
-                Ty::Vec(Box::new(e))
+                Ty::Vec(Box::new(e), self.ann())
             }
             "concat" | "flatten" => {
                 let mut e = Ty::Nil;
                 for t in &ts {
-                    let x = if name == "flatten" { Ty::Dyn } else { self.element(t) };
+                    let x = if name == "flatten" { self.dyn_() } else { self.element(t) };
                     e = self.join(&e, &x);
                 }
-                Ty::Vec(Box::new(e))
+                Ty::Vec(Box::new(e), self.ann())
             }
             "list" => {
                 let mut e = Ty::Nil;
                 for t in &ts {
                     e = self.join(&e, t);
                 }
-                Ty::Vec(Box::new(e))
+                Ty::Vec(Box::new(e), self.ann())
             }
             "range" => {
                 for (i, t) in ts.iter().enumerate() {
-                    self.expect(t, &Ty::Num, &format!("argument {} of `range`", i + 1));
+                    let n = self.prim(Prim::Num);
+                    self.expect(t, &n, &format!("argument {} of `range`", i + 1));
+                    self.sink(t, K0313);
                 }
-                Ty::Vec(Box::new(Ty::Num))
+                let n = self.prim(Prim::Num);
+                Ty::Vec(Box::new(n), self.ann())
             }
             "get" => {
                 let t = match (self.resolve(&arg(0)), args.get(1)) {
                     (_, Some(Value::Keyword(k))) | (_, Some(Value::Str(k))) => self.field(&arg(0), k),
-                    (Ty::Vec(e), _) => *e,
-                    (Ty::Map(v), _) => *v,
-                    _ => Ty::Dyn,
+                    (Ty::Vec(e, _), _) => *e,
+                    (Ty::Map(v, _), _) => *v,
+                    (Ty::Dyn(a), _) => {
+                        let b = self.ann();
+                        self.g.edge(a, b);
+                        Ty::Dyn(b)
+                    }
+                    _ => self.dyn_(),
                 };
                 match ts.get(2) {
                     Some(d) => self.join(&t, d),
@@ -931,26 +1502,26 @@ impl Infer {
                 let mut f = Fields::new();
                 for t in &ts {
                     match self.resolve(t) {
-                        Ty::Rec(g, Tail::Closed) => f.extend(g),
+                        Ty::Rec(g, Tail::Closed, _) => f.extend(g),
                         Ty::Nil => {}
-                        _ => return Ty::Dyn,
+                        _ => return self.dyn_(),
                     }
                 }
-                Ty::Rec(f, Tail::Closed)
+                Ty::Rec(f, Tail::Closed, self.ann())
             }
             "assoc" => match self.resolve(&arg(0)) {
-                Ty::Rec(mut f, Tail::Closed) => {
+                Ty::Rec(mut f, Tail::Closed, _) => {
                     for pair in args[1.min(args.len())..].chunks(2).zip(ts[1.min(ts.len())..].chunks(2)) {
                         match (pair.0.first(), pair.1.get(1)) {
                             (Some(Value::Keyword(k)), Some(t)) => {
                                 f.insert(k.to_string(), (t.clone(), false));
                             }
-                            _ => return Ty::Dyn,
+                            _ => return self.dyn_(),
                         }
                     }
-                    Ty::Rec(f, Tail::Closed)
+                    Ty::Rec(f, Tail::Closed, self.ann())
                 }
-                _ => Ty::Dyn,
+                _ => self.dyn_(),
             },
             "map" | "mapcat" | "filter" if !args.is_empty() => {
                 let mut elems = vec![];
@@ -959,14 +1530,19 @@ impl Infer {
                 }
                 let r = self.apply(&arg(0), &elems, &args[0]);
                 match name {
-                    "map" => Ty::Vec(Box::new(r)),
+                    "map" => Ty::Vec(Box::new(r), self.ann()),
                     "mapcat" => {
                         let e = self.element(&r);
-                        Ty::Vec(Box::new(e))
+                        Ty::Vec(Box::new(e), self.ann())
                     }
                     _ => {
-                        let e = elems.first().cloned().unwrap_or(Ty::Dyn);
-                        Ty::Vec(Box::new(e))
+                        // the predicate decides which elements exist
+                        self.sink(&r, K0312);
+                        let e = match elems.first() {
+                            Some(e) => e.clone(),
+                            None => self.dyn_(),
+                        };
+                        Ty::Vec(Box::new(e), self.ann())
                     }
                 }
             }
@@ -976,18 +1552,25 @@ impl Infer {
                     let r = self.apply(&ts[0], &[ts[1].clone(), e], &args[0]);
                     self.join(&ts[1], &r)
                 } else {
-                    Ty::Dyn
+                    if let Some(t) = ts.last() {
+                        self.element(t);
+                    }
+                    self.dyn_()
                 }
             }
-            "keys" => Ty::Vec(Box::new(Ty::Str)),
+            "apply" => {
+                if let Some(t) = ts.last() {
+                    self.sink(t, K0313);
+                }
+                self.dyn_()
+            }
+            "keys" => {
+                let s = self.prim(Prim::Str);
+                Ty::Vec(Box::new(s), self.ann())
+            }
             "identity" | "with-meta" | "secret" => arg(0),
-            "keyword" => Ty::Kw,
-            _ => Ty::Dyn,
+            _ => self.dyn_(),
         }
-    }
-
-    fn ctor_name(&mut self, sym: &str) -> Option<String> {
-        self.ctors.get(sym).cloned()
     }
 
     /// Resolve every namespaced symbol in a form while the interpreter is at hand.
@@ -1014,15 +1597,18 @@ impl Infer {
 
     // ------------------------------------------------------------ top level
 
-    /// Infer one top-level form. Macros are expanded first, using the
-    /// interpreter as it stands before the form is evaluated.
-    pub fn toplevel(&mut self, it: &mut Interp, form: &Value) {
+    /// Infer one top-level form, using the interpreter as it stands before
+    /// the form is evaluated. Returns the stage errors this form introduced.
+    pub fn toplevel(&mut self, it: &mut Interp, form: &Value) -> usize {
         let expanded = match it.expand_all(form, 0) {
             Ok(e) => e,
-            Err(_) => return, // evaluation reports it
+            Err(_) => return 0,
         };
         self.learn_ctors(it, &expanded);
+        let before = self.errors.len();
         self.form(&expanded);
+        self.settle();
+        self.errors.len() - before
     }
 
     fn form(&mut self, f: &Value) {
@@ -1049,6 +1635,7 @@ impl Infer {
             "def" => {
                 if let (Some(Value::Symbol(n)), Some(v)) = (items.get(1), items.get(2)) {
                     let t = self.infer(v);
+                    self.conditionals();
                     self.define(n, &t);
                 }
             }
@@ -1059,11 +1646,73 @@ impl Infer {
                         i += 1;
                     }
                     let t = self.infer_fn(Some(n), items.get(i), &items[(i + 1).min(items.len())..]);
+                    self.conditionals();
                     self.define(n, &t);
                 }
             }
             _ => {
                 self.infer_list(items);
+            }
+        }
+    }
+
+    /// An `if` whose branches declare resources needs a compile-time
+    /// condition. Turn each such `if` into a sink on its condition.
+    fn conditionals(&mut self) {
+        let declares = self.g.reach(&[self.decl]);
+        for p in std::mem::take(&mut self.pending) {
+            if declares.contains_key(&p.branch) {
+                let s = self.g.add(Node::Sink { code: K0312.0, msg: K0312.1.into(), help: K0312.2, pos: p.pos });
+                self.g.edge(p.cond, s);
+            }
+        }
+    }
+
+    /// Report every sink a source reaches, once.
+    fn settle(&mut self) {
+        self.conditionals();
+        let sources: Vec<u32> = self
+            .g
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, Node::Src { .. }))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let reached = self.g.reach(&sources);
+        let mut hits: Vec<(u32, u32)> = reached
+            .iter()
+            .filter(|(n, _)| matches!(self.g.nodes[**n as usize], Node::Sink { .. }) && !self.reported.contains(n))
+            .map(|(n, o)| (*n, *o))
+            .collect();
+        let pos_of = |g: &Graph, n: u32| match &g.nodes[n as usize] {
+            Node::Sink { pos, .. } => pos.map_or((u32::MAX, u32::MAX), |p| (p.line, p.col)),
+            _ => (u32::MAX, u32::MAX),
+        };
+        hits.sort_by_key(|(sink, _)| (pos_of(&self.g, *sink), *sink));
+        let mut seen_sites = HashSet::new();
+        for (sink, origin) in hits {
+            self.reported.insert(sink);
+            if !self.blamed.insert(origin) {
+                continue;
+            }
+            if let (Node::Sink { code, msg, help, pos }, Node::Src { desc, pos: spos }) =
+                (self.g.nodes[sink as usize].clone(), self.g.nodes[origin as usize].clone())
+            {
+                // one report per place and kind
+                if !seen_sites.insert((code, pos.map(|p| (p.line, p.col)))) {
+                    continue;
+                }
+                if self.errors.iter().any(|e| e.code == code && e.pos == pos) {
+                    continue;
+                }
+                let at = spos.map(|p| format!(" (line {}, column {})", p.line, p.col)).unwrap_or_default();
+                self.errors.push(StageError {
+                    code,
+                    msg: format!("{}: it depends on {}{}", msg, desc, at),
+                    help,
+                    pos,
+                });
             }
         }
     }
@@ -1076,32 +1725,28 @@ impl Infer {
     }
 
     fn show_in(&self, t: &Ty, names: &mut HashMap<String, String>) -> String {
-        let mut name = |key: String, prefix: &str| -> String {
-            let n = names.len();
-            names
-                .entry(key)
-                .or_insert_with(|| {
-                    if prefix.is_empty() {
-                        ((b'a' + (n % 26) as u8) as char).to_string()
-                    } else {
-                        format!("{}{}", prefix, n)
-                    }
-                })
-                .clone()
-        };
         match t {
-            Ty::Var(v) => name(format!("t{}", v), ""),
-            Ty::Dyn => "?".into(),
+            Ty::Var(v) => {
+                let n = names.len();
+                names.entry(format!("t{}", v)).or_insert_with(|| ((b'a' + (n % 26) as u8) as char).to_string()).clone()
+            }
+            Ty::Dyn(_) => "?".into(),
             Ty::Nil => "Nil".into(),
-            Ty::Bool => "Bool".into(),
-            Ty::Num => "Num".into(),
-            Ty::Str => "Str".into(),
-            Ty::Kw => "Kw".into(),
+            Ty::P(p, _) => format!("{:?}", p),
             Ty::Module => "Module".into(),
-            Ty::Res(ty, d) => format!("{}{}", if *d { "data " } else { "" }, ty),
-            Ty::Vec(e) => format!("[{}]", self.show_in(e, names)),
-            Ty::Map(e) => format!("(Map {})", self.show_in(e, names)),
-            Ty::Rec(f, tail) => {
+            Ty::Res(ty, d, _, i) => format!(
+                "{}{}{}",
+                if *d { "data " } else { "" },
+                ty,
+                match i {
+                    1 => " (count)",
+                    2 => " (for_each)",
+                    _ => "",
+                }
+            ),
+            Ty::Vec(e, _) => format!("[{}]", self.show_in(e, names)),
+            Ty::Map(e, _) => format!("(Map {})", self.show_in(e, names)),
+            Ty::Rec(f, tail, _) => {
                 let mut parts: Vec<String> = f
                     .iter()
                     .map(|(k, (t, o))| format!(":{}{} {}", k, if *o { "?" } else { "" }, self.show_in(t, names)))
@@ -1113,7 +1758,7 @@ impl Infer {
                 }
                 format!("{{{}}}", parts.join(", "))
             }
-            Ty::Fn(ps, rest, ret) => {
+            Ty::Fn(ps, rest, ret, _) => {
                 let mut parts: Vec<String> = ps.iter().map(|p| self.show_in(p, names)).collect();
                 if rest.is_some() {
                     parts.push("& ?".into());
@@ -1121,11 +1766,5 @@ impl Infer {
                 format!("(Fn [{}] {})", parts.join(" "), self.show_in(ret, names))
             }
         }
-    }
-}
-
-impl Default for Infer {
-    fn default() -> Self {
-        Infer::new()
     }
 }

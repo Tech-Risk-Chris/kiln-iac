@@ -65,6 +65,8 @@ provider's schema before anything is written:
 | K0320 | a secret flowing into an argument that is not sensitive, or into `count` / `for_each` |
 | K0321 | an output that exposes a secret without `:sensitive true` |
 | K0322 | `(secret x)` on a value written in the source |
+| K0317 | `:count` or `:for_each` set inside `count-deferred` / `for-each-deferred` |
+| K0318 | `for-each-deferred` nested in either form, or `count-deferred` inside `for-each-deferred` |
 
 All problems are reported together, each at the declaration that caused it.
 A value that is a Terraform expression passes: its type is known only to the
@@ -143,6 +145,11 @@ it. Addresses are unchanged, so the first plan against existing state is a no-op
   iterating over one, or naming a resource with one is a compile error (K0312 to K0316).
   The type checker finds this in every function and branch, including code that no
   build runs, and names the attribute the value came from.
+- **When only the engine knows.** `(count-deferred cond body...)` and
+  `(for-each-deferred [x coll] body...)` give every declaration in the body a real
+  `count` or `for_each`, with `x` as `each.value`. References to those resources come
+  out as `one(x[*].a)`, `x[each.key].a` inside the block, or a keyed map outside.
+  See `examples/deferred`.
 - **No forward references; only structural recursion.** A definition sees only what
   precedes it, and a function may call itself only on a strictly smaller part of one
   of its parameters: `(rest xs)`, a destructured part, `(:children node)`, an element.
@@ -171,6 +178,7 @@ src/recursion.rs  the structural recursion check
 src/infer.rs      gradual type inference
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
+examples/deferred/        count-deferred and for-each-deferred
 examples/import-offline/  HCL fixture for the importer, credential-free providers
 tests/fixtures/move/      three versions of one stack for tools/move-test.sh
 .kiln/schemas/            cached provider schemas (Google 6.50.0)
