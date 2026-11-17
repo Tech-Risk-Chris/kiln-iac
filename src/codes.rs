@@ -148,8 +148,8 @@ pub const CODES: &[Code] = &[
     Code { code: "K0601", title: "cyclic declarations", explain: "The imported declarations refer to each other in a cycle, so they cannot be ordered for a language without forward references." },
     // ---------------------------------------------------------------- schemas
     Code { code: "K0700", title: "unknown resource type", explain: "The provider's cached schema has no such resource type or data source. The message suggests the closest name." },
-    Code { code: "K0701", title: "unknown argument", explain: "The schema has no argument or nested block of this name, at any depth. The message suggests the closest name." },
-    Code { code: "K0702", title: "missing required argument", explain: "A required argument or nested block is missing." },
+    Code { code: "K0701", title: "unknown argument", explain: "The schema has no argument or nested block of this name, at any depth, or a module has no variable of this name. The message suggests the closest name." },
+    Code { code: "K0702", title: "missing required argument", explain: "A required argument or nested block is missing, or a module variable without a default is not given." },
     Code { code: "K0703", title: "read-only attribute set", explain: "The provider computes this attribute; it cannot be set. Read it from the resource instead." },
     Code {
         code: "K0704",
@@ -158,7 +158,7 @@ pub const CODES: &[Code] = &[
     },
     Code { code: "K0705", title: "nested block given as a value", explain: "A nested block must be a map, or for list and set blocks a vector of maps. Terraform cannot compute a block from an expression." },
     Code { code: "K0706", title: "wrong number of nested blocks", explain: "A nested block appears more or fewer times than the schema allows." },
-    Code { code: "K0707", title: "unknown attribute read", explain: "Reading an attribute that the resource, or a nested block of it, does not have. The message suggests the closest name." },
+    Code { code: "K0707", title: "unknown attribute read", explain: "Reading an attribute that the resource, or a nested block of it, does not have, or an output that a module does not declare. The message suggests the closest name." },
     Code { code: "K0708", title: "reading from a collection of blocks", explain: "An attribute was read from a list or set of blocks. Pick one first: `(get x 0)` for a list, `(tf/one x)` for a set." },
     Code {
         code: "K0711",
@@ -171,6 +171,16 @@ pub const CODES: &[Code] = &[
         explain: "A provider has no cached schema, so its declarations are not checked. A warning, or an error with `--strict`. Run `kiln schema <file.kiln>` and commit what it writes under .kiln/schemas/.",
     },
     Code { code: "K0713", title: "unreadable cached schema", explain: "A file under .kiln/schemas/ is not a valid schema cache. Regenerate it with `kiln schema`." },
+    Code {
+        code: "K0714",
+        title: "no cached module interface",
+        explain: "A module has no cached interface, so its inputs and outputs are not checked. A warning, or an error with `--strict`. Run `kiln schema <file.kiln>` and commit what it writes under .kiln/modules/; local modules are read directly, remote ones are installed with the engine.",
+    },
+    Code {
+        code: "K0715",
+        title: "cached module interface has the wrong version",
+        explain: "The cached interface of a module does not satisfy the version constraint in the module call, so it is not used to check. Refresh it with `kiln schema <file.kiln>`.",
+    },
     Code { code: "K0750", title: "deprecated argument", explain: "A warning: the provider marks this argument deprecated." },
     // ---------------------------------------------------------------- user
     Code { code: "K0900", title: "fail", explain: "Raised by `(fail ...)` in the program itself; the message is the program's." },

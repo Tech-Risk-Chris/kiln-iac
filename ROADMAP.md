@@ -7,7 +7,7 @@ Milestones are ordered so that the adoption-critical parts (output shape, addres
 | M0 Core | Done | Met: the hand-written GKE example plans identically to its HCL original |
 | M1 Address safety | Done | Met on the repository's fixtures; a real client repository is still to try |
 | M2 Schema checking | Done | Met: every mistake in a seeded corpus of 20 is caught before Terraform runs |
-| M3 Types, staging, secrecy | In progress: 6 of 7 steps | Met: deferred values that would shape the graph are compile errors, also in code that never runs |
+| M3 Types, staging, secrecy | Done | Met: deferred values that would shape the graph are compile errors, also in code that never runs |
 | M4 Stacks and contexts | | |
 | M5 Hardening | | |
 
@@ -40,7 +40,7 @@ This replaced the original M2 ("types"). Checking the evaluated graph gives user
 - Structural recursion, which the type checker can verify.
 - Typed module inputs and outputs.
 
-Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, structural self-recursion, gradual shape inference, and the stage and effect analysis that meets the gate. `count-deferred` and `for-each-deferred` hand structure the engine decides to Terraform. Resource arguments and secrets are checked during inference too, so mistakes in code that never runs are found. Still to come: typed modules (step 7).
+Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, structural self-recursion, gradual shape inference, and the stage and effect analysis that meets the gate. `count-deferred` and `for-each-deferred` hand structure the engine decides to Terraform. Resource arguments and secrets are checked during inference too, so mistakes in code that never runs are found. Module calls are checked against cached module interfaces (`.kiln/modules/`), and sensitive module outputs are secrets.
 
 **Gate:** the corpus of known `for_each` and `count` plan-time failures becomes compile errors, including in code paths that do not run. Met in `tests/m3.rs`.
 
@@ -59,6 +59,8 @@ Macro hygiene beyond gensym, the language server and formatter, Datalog policy r
 ## Known limits carried forward
 
 - One cached schema version per provider per repository.
-- Values that are Terraform expressions are not type-checked until M3.
+- Values that are Terraform expressions (`tf/expr`) are typed as unknown: they pass every shape check.
+- Shape mismatches from inference are shown by `kiln types`, not enforced.
+- Module outputs are typed `dynamic`: HCL outputs declare no type.
 - `kiln import` does not handle `dynamic` blocks, variables without defaults, provisioners, `moved` / `import` / `check` blocks, or template directives.
 - Comments are not carried over by `kiln import`.

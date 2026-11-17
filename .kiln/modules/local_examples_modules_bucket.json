@@ -1,0 +1,63 @@
+{
+  "format": "kiln-module/1",
+  "inputs": {
+    "attributes": {
+      "kms_key": {
+        "optional": true,
+        "sensitive": true,
+        "type": "string"
+      },
+      "labels": {
+        "optional": true,
+        "type": [
+          "map",
+          "string"
+        ]
+      },
+      "location": {
+        "optional": true,
+        "type": "string"
+      },
+      "name": {
+        "required": true,
+        "type": "string"
+      },
+      "versioning": {
+        "optional": true,
+        "type": [
+          "object",
+          {
+            "enabled": "bool",
+            "keep_last": "number"
+          },
+          [
+            "keep_last"
+          ]
+        ]
+      }
+    }
+  },
+  "key": "local:examples/modules/bucket",
+  "outputs": {
+    "attributes": {
+      "kms_key": {
+        "computed": true,
+        "sensitive": true,
+        "type": "dynamic"
+      },
+      "name": {
+        "computed": true,
+        "type": "dynamic"
+      },
+      "self_link": {
+        "computed": true,
+        "type": "dynamic"
+      },
+      "url": {
+        "computed": true,
+        "type": "dynamic"
+      }
+    }
+  },
+  "version": ""
+}

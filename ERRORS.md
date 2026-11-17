@@ -45,6 +45,8 @@ Generated from `src/codes.rs`; do not edit by hand. `kiln explain <code>` prints
 | [K0711](#k0711) | cached schema has the wrong version |
 | [K0712](#k0712) | no cached schema |
 | [K0713](#k0713) | unreadable cached schema |
+| [K0714](#k0714) | no cached module interface |
+| [K0715](#k0715) | cached module interface has the wrong version |
 | [K0750](#k0750) | deprecated argument |
 | [K0900](#k0900) | fail |
 
@@ -170,11 +172,11 @@ Generated from `src/codes.rs`; do not edit by hand. `kiln explain <code>` prints
 
 ## K0701
 
-**Unknown argument.** The schema has no argument or nested block of this name, at any depth. The message suggests the closest name.
+**Unknown argument.** The schema has no argument or nested block of this name, at any depth, or a module has no variable of this name. The message suggests the closest name.
 
 ## K0702
 
-**Missing required argument.** A required argument or nested block is missing.
+**Missing required argument.** A required argument or nested block is missing, or a module variable without a default is not given.
 
 ## K0703
 
@@ -194,7 +196,7 @@ Generated from `src/codes.rs`; do not edit by hand. `kiln explain <code>` prints
 
 ## K0707
 
-**Unknown attribute read.** Reading an attribute that the resource, or a nested block of it, does not have. The message suggests the closest name.
+**Unknown attribute read.** Reading an attribute that the resource, or a nested block of it, does not have, or an output that a module does not declare. The message suggests the closest name.
 
 ## K0708
 
@@ -211,6 +213,14 @@ Generated from `src/codes.rs`; do not edit by hand. `kiln explain <code>` prints
 ## K0713
 
 **Unreadable cached schema.** A file under .kiln/schemas/ is not a valid schema cache. Regenerate it with `kiln schema`.
+
+## K0714
+
+**No cached module interface.** A module has no cached interface, so its inputs and outputs are not checked. A warning, or an error with `--strict`. Run `kiln schema <file.kiln>` and commit what it writes under .kiln/modules/; local modules are read directly, remote ones are installed with the engine.
+
+## K0715
+
+**Cached module interface has the wrong version.** The cached interface of a module does not satisfy the version constraint in the module call, so it is not used to check. Refresh it with `kiln schema <file.kiln>`.
 
 ## K0750
 

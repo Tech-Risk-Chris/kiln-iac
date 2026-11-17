@@ -24,12 +24,14 @@ pub enum Kind {
     Resource,
     Data,
     Provider,
+    Module,
 }
 
 const RESOURCE_META: &[&str] =
     &["count", "for_each", "depends_on", "provider", "lifecycle", "provisioner", "connection", "dynamic"];
 const DATA_META: &[&str] = &["count", "for_each", "depends_on", "provider", "lifecycle", "dynamic"];
 const PROVIDER_META: &[&str] = &["alias"];
+pub const MODULE_META: &[&str] = &["source", "version", "providers", "count", "for_each", "depends_on"];
 const LIFECYCLE: &[&str] = &[
     "create_before_destroy",
     "prevent_destroy",
@@ -396,6 +398,7 @@ pub fn check_body(kind: Kind, block: &J, body: &J) -> Vec<Issue> {
         Kind::Resource => RESOURCE_META,
         Kind::Data => DATA_META,
         Kind::Provider => PROVIDER_META,
+        Kind::Module => MODULE_META,
     };
     let mut out = vec![];
     check_block(block, body, "", meta, &mut out);
@@ -490,6 +493,7 @@ pub fn check_secrets(kind: Kind, block: &J, args: &Value) -> Vec<Issue> {
         Kind::Resource => RESOURCE_META,
         Kind::Data => DATA_META,
         Kind::Provider => PROVIDER_META,
+        Kind::Module => MODULE_META,
     };
     let mut out = vec![];
     secrets_in(block, args, "", meta, &mut out);

@@ -47,6 +47,9 @@ pub struct BuildOpts<'a> {
     pub schemas: Option<std::rc::Rc<schema::SchemaSet>>,
     /// A provider without a cached schema is an error, not a warning.
     pub strict: bool,
+    /// Where main.tf.json goes, if not `out/` next to the stack. Local module
+    /// sources are written relative to it.
+    pub out_dir: Option<std::path::PathBuf>,
 }
 
 fn unchecked_provider(source: &str) -> KilnError {
@@ -60,6 +63,8 @@ fn unchecked_provider(source: &str) -> KilnError {
 pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     let mut it = eval::Interp::new().map_err(|e| e.render(file, src))?;
     it.schemas = opts.schemas.clone();
+    it.stack_dir = stack_dir(file);
+    it.out_dir = opts.out_dir.clone();
     let mut errors: Vec<String> = vec![];
     let mut fatal = None;
     let mut ty = infer::Infer::new();
@@ -96,6 +101,15 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
             errors.push(format!("error[K0713]: cannot read a cached schema: {}\n", e));
         }
     }
+    for source in &it.unchecked_modules {
+        let e = KilnError::new("K0714", format!("no cached interface for the module {}; its inputs and outputs are not checked", source))
+            .help("run `kiln schema <file.kiln>` and commit the files it writes under .kiln/modules/");
+        if opts.strict {
+            errors.push(e.render(file, src));
+        } else {
+            warnings.push(e.render_as("warning", file, src));
+        }
+    }
     for source in &it.unchecked {
         let e = unchecked_provider(source);
         if opts.strict {
@@ -122,6 +136,13 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves, warnings, type_clashes })
 }
 
+fn stack_dir(file: &str) -> std::path::PathBuf {
+    match std::path::Path::new(file).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    }
+}
+
 fn stage_error(e: &infer::StageError) -> KilnError {
     KilnError { code: e.code, msg: e.msg.clone(), pos: e.pos, help: if e.help.is_empty() { None } else { Some(e.help.clone()) } }
 }
@@ -146,6 +167,7 @@ pub struct TypeReport {
 pub fn types(src: &str, file: &str, schemas: Option<std::rc::Rc<schema::SchemaSet>>) -> Result<TypeReport, String> {
     let mut it = eval::Interp::new().map_err(|e| e.render(file, src))?;
     it.schemas = schemas;
+    it.stack_dir = stack_dir(file);
     let mut ty = infer::Infer::new();
     let forms = reader::read_all(src).map_err(|e| e.render(file, src))?;
     for form in forms {
@@ -159,6 +181,64 @@ pub fn types(src: &str, file: &str, schemas: Option<std::rc::Rc<schema::SchemaSe
     let defs = ty.defs.iter().map(|(n, t)| (n.clone(), ty.show(t))).collect();
     let errors = ty.errors.iter().map(|e| stage_error(e).render(file, src)).collect();
     Ok(TypeReport { defs, clashes: render_clashes(&ty, file, src), errors })
+}
+
+/// The modules a stack declares: (source, version). The stack is evaluated
+/// without checks; if that fails, literal `(module ...)` forms are read instead.
+pub fn modules_of(src: &str, _file: &str) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = vec![];
+    let mut push = |s: &str, v: Option<&str>| {
+        let e = (s.to_string(), v.map(String::from));
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    };
+    let evaluated = (|| -> Result<Vec<serde_json::Value>, KilnError> {
+        let mut it = eval::Interp::new()?;
+        it.rebase_sources = false;
+        for form in reader::read_all(src)? {
+            it.eval_toplevel(&form)?;
+        }
+        Ok(it.graph.modules.values().cloned().collect())
+    })();
+    match evaluated {
+        Ok(ms) => {
+            for m in ms {
+                if let Some(s) = m["source"].as_str() {
+                    push(s, m["version"].as_str());
+                }
+            }
+        }
+        Err(_) => {
+            fn scan(v: &Value, push: &mut dyn FnMut(&str, Option<&str>)) {
+                match v {
+                    Value::List(items, _) => {
+                        if items.first().and_then(|h| h.sym_name()) == Some("module") {
+                            if let Some(Value::Map(m)) = items.get(2) {
+                                let get = |k: &str| value::map_get(m, &Value::kw(k));
+                                if let Some(Value::Str(s)) = get("source") {
+                                    let v = match get("version") {
+                                        Some(Value::Str(v)) => Some(v.to_string()),
+                                        _ => None,
+                                    };
+                                    push(&s, v.as_deref());
+                                }
+                            }
+                        }
+                        items.iter().for_each(|i| scan(i, push));
+                    }
+                    Value::Vector(items) => items.iter().for_each(|i| scan(i, push)),
+                    _ => {}
+                }
+            }
+            if let Ok(forms) = reader::read_all(src) {
+                for f in &forms {
+                    scan(f, &mut push);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The providers a stack declares in its `ns` form: (name, source, version constraint).

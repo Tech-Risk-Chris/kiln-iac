@@ -53,6 +53,15 @@ pub struct Interp {
     pub warnings: Vec<KilnError>,
     /// Providers that have no cached schema; their declarations are not checked.
     pub unchecked: std::collections::BTreeSet<String>,
+    /// Modules that have no cached interface.
+    pub unchecked_modules: std::collections::BTreeSet<String>,
+    /// The directory of the stack's source file, for local module paths.
+    pub stack_dir: std::path::PathBuf,
+    /// Where the output goes; None: `out/` in the stack directory.
+    pub out_dir: Option<std::path::PathBuf>,
+    /// Write local module sources relative to the output; off when only the
+    /// sources as written are wanted (`kiln schema`).
+    pub rebase_sources: bool,
     version_checked: std::collections::HashSet<String>,
     pos_stack: Vec<Pos>,
     /// Active calls of recursive functions: (function, size of its shrinking argument).
@@ -102,7 +111,13 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
                     Inst::Each(_) => TfExpr::Instance(h.address(), InstMode::All),
                 });
                 match &h.schema {
-                    Some(block) => read_shaped(base, &Shape::Block(block.clone()), k, &h.ty)?,
+                    Some(block) => {
+                        let what = match h.kind {
+                            HandleKind::Module => format!("`{}`", h.address()),
+                            _ => h.ty.to_string(),
+                        };
+                        read_shaped(base, &Shape::Block(block.clone()), k, &what)?
+                    }
                     None => Value::Deferred(Rc::new(TfExpr::Attr(base, k.to_string()))),
                 }
             }
@@ -253,6 +268,10 @@ impl Interp {
             diags: vec![],
             warnings: vec![],
             unchecked: Default::default(),
+            unchecked_modules: Default::default(),
+            stack_dir: std::path::PathBuf::from("."),
+            out_dir: None,
+            rebase_sources: true,
             version_checked: Default::default(),
             pos_stack: vec![],
             rec_stack: vec![],
@@ -947,7 +966,35 @@ impl Interp {
             J::Object(o) => o,
             _ => unreachable!(),
         };
-        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone(), schema: None, inst };
+        // check the inputs against the module's variables
+        let source = m.get("source").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let version = m.get("version").and_then(|s| s.as_str()).map(String::from);
+        let mut outputs = None;
+        if self.schemas.is_some() {
+            match self.module_interface(&source, version.as_deref()) {
+                (Some(iface), _) => {
+                    let issues = check::check_body(check::Kind::Module, &iface.inputs, &J::Object(m.clone()));
+                    self.report(&format!("module.{}", name), issues);
+                    outputs = Some(iface.outputs.clone());
+                }
+                (None, Some(mismatch)) => {
+                    let e = KilnError::new("K0715", mismatch)
+                        .help("refresh it with `kiln schema <file.kiln>`")
+                        .at(self.current_pos());
+                    self.diags.push(e);
+                }
+                (None, None) => {
+                    self.unchecked_modules.insert(source.clone());
+                }
+            }
+        }
+        // Kiln resolves a local source from the stack; Terraform from the output directory.
+        let mut m = m;
+        if self.rebase_sources && (source.starts_with("./") || source.starts_with("../")) {
+            let rebased = schema::rebase_source(&source, &self.stack_dir, self.out_dir.as_deref());
+            m.insert("source".into(), J::String(rebased));
+        }
+        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone(), schema: outputs, inst };
         if self.graph.modules.insert(name, J::Object(m)).is_some() {
             return fail("K0202", format!("`{}` is declared twice", h.address()));
         }
@@ -1374,6 +1421,25 @@ impl Interp {
         }
         let table = if data { &ps.data_sources } else { &ps.resources };
         table.get(ty).cloned()
+    }
+
+    /// The cached interface of a module, if there is one whose version
+    /// satisfies the constraint. The second value is a version mismatch.
+    pub fn module_interface(&self, source: &str, version: Option<&str>) -> (Option<Rc<schema::ModuleInterface>>, Option<String>) {
+        let set = match &self.schemas {
+            Some(s) => s,
+            None => return (None, None),
+        };
+        let key = schema::module_key(source, &self.stack_dir, set.dir().and_then(|d| d.parent()));
+        match set.module(&key) {
+            Some(m) => match version {
+                Some(c) if !m.version.is_empty() && !schema::satisfies(&m.version, c).unwrap_or(true) => {
+                    (None, Some(format!("the cached interface of {} is version {}, which does not satisfy \"{}\"", key, m.version, c)))
+                }
+                _ => (Some(m), None),
+            },
+            None => (None, None),
+        }
     }
 
     // ------------------------------------------------------------ schemas

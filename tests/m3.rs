@@ -400,7 +400,7 @@ const VALID_STAGES: &[&str] = &[
     // conditions known at compile time decide existence
     r#"(def env "dev") (def n (when (= env "prod") (g/compute_network "n" {:name "n"})))"#,
     // deferred values in strings, numbers and Terraform functions
-    r#"(def mtu (+ 1 (:node_version_count c))) (def up (tf/upper (:name c)))"#,
+    r#"(def mtu (+ 1 (:initial_node_count c))) (def up (tf/upper (:name c)))"#,
 ];
 
 #[test]
@@ -619,4 +619,151 @@ fn secrets_may_go_where_they_belong_statically_too() {
            (defn ok4 [] (g/compute_network "n" {:name "n" :description (:cluster_ca_certificate (get (:master_auth c) 0))}))"#
     ));
     assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+// ------------------------------------------------------------------ step 7: typed modules
+
+/// A stack next to the `bucket` module of examples/modules, whose interface is
+/// cached in .kiln/modules.
+const MOD_FILE: &str = "examples/modules/t.kiln";
+
+fn mod_build(body: &str, strict: bool) -> Result<kiln::Build, String> {
+    let src = format!("{}{}\n", G, body);
+    let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+    build(&src, MOD_FILE, &BuildOpts { schemas: Some(schemas), strict, ..BuildOpts::default() })
+}
+
+fn mod_errors(body: &str) -> Vec<String> {
+    let src = format!("{}{}\n", G, body);
+    let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+    kiln::types(&src, MOD_FILE, Some(schemas)).unwrap_or_else(|e| panic!("{}", e)).errors
+}
+
+#[test]
+fn a_module_interface_is_read_from_its_variables_and_outputs() {
+    let (inputs, outputs) = kiln::schema::module_interface_from_dir(std::path::Path::new("examples/modules/bucket")).unwrap();
+    let attr = |b: &serde_json::Value, n: &str| b["attributes"][n].clone();
+    assert_eq!(attr(&inputs, "name")["required"], true);
+    assert_eq!(attr(&inputs, "name")["type"], "string");
+    assert_eq!(attr(&inputs, "location")["optional"], true);
+    assert_eq!(attr(&inputs, "labels")["type"], serde_json::json!(["map", "string"]));
+    assert_eq!(
+        attr(&inputs, "versioning")["type"],
+        serde_json::json!(["object", {"enabled": "bool", "keep_last": "number"}, ["keep_last"]])
+    );
+    assert_eq!(attr(&inputs, "kms_key")["sensitive"], true);
+    assert_eq!(attr(&outputs, "url")["computed"], true);
+    assert_eq!(attr(&outputs, "kms_key")["sensitive"], true);
+    assert!(outputs["attributes"].get("nope").is_none());
+}
+
+#[test]
+fn the_cached_interface_is_what_kiln_schema_writes() {
+    let (inputs, outputs) = kiln::schema::module_interface_from_dir(std::path::Path::new("examples/modules/bucket")).unwrap();
+    let want = kiln::schema::render_module_cache("local:examples/modules/bucket", "", &inputs, &outputs);
+    let got = std::fs::read_to_string(".kiln/modules/local_examples_modules_bucket.json").unwrap();
+    assert_eq!(got, want, "run `kiln schema examples/modules/main.kiln`");
+}
+
+/// Module calls that are wrong, both evaluated and in code that never runs.
+const BAD_CALLS: &[(&str, &str, &str)] = &[
+    (r#"(module "b" {:source "./bucket" :name "x" :locaton "EU"})"#, "K0701", "did you mean `location`?"),
+    (r#"(module "b" {:source "./bucket" :location "EU"})"#, "K0702", "missing required argument `name`"),
+    (r#"(module "b" {:source "./bucket" :name "x" :versioning "on"})"#, "K0704", "`versioning` must be"),
+    (r#"(module "b" {:source "./bucket" :name "x" :labels ["a"]})"#, "K0704", "`labels` must be"),
+    (r#"(module "b" {:source "./bucket" :name "x" :versioning {:enabled "yes"}})"#, "K0704", "`versioning.enabled` must be"),
+];
+
+#[test]
+fn module_inputs_are_checked() {
+    let mut missed = vec![];
+    for (snippet, code, text) in BAD_CALLS {
+        match mod_build(snippet, false) {
+            Ok(_) => missed.push(format!("{}: built", snippet)),
+            Err(e) if e.contains(&format!("error[{}]", code)) && e.contains(text) && e.contains("module.b") => {}
+            Err(e) => missed.push(format!("{}\n  want {} with {:?}, got:\n{}", snippet, code, text, e)),
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
+}
+
+#[test]
+fn module_inputs_are_checked_in_code_that_never_runs() {
+    let mut missed = vec![];
+    for (snippet, code, text) in BAD_CALLS {
+        let snippet = snippet.replace(r#"(module "b""#, "(module n");
+        let errs = mod_errors(&format!("(defn never [n] {})", snippet));
+        if !errs.iter().any(|e| e.contains(&format!("error[{}]", code)) && e.contains(text)) {
+            missed.push(format!("{}\n  want {} with {:?}, got:\n{}", snippet, code, text, errs.join("\n")));
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
+}
+
+#[test]
+fn module_outputs_are_checked() {
+    let e = mod_build(r#"(def b (module "b" {:source "./bucket" :name "x"})) (output "u" (:uri b))"#, false).err().unwrap();
+    assert!(e.contains("error[K0707]") && e.contains("did you mean `url`?"), "{}", e);
+    let errs = mod_errors(r#"(defn never [] (:uri (module "b" {:source "./bucket" :name "x"})))"#);
+    assert!(errs.iter().any(|e| e.contains("K0707") && e.contains("uri")), "{}", errs.join("\n"));
+}
+
+#[test]
+fn sensitive_module_outputs_are_secrets() {
+    let body = r#"(def b (module "b" {:source "./bucket" :name "x"}))"#;
+    let e = mod_build(&format!(r#"{} (output "k" (:kms_key b))"#, body), false).err().unwrap();
+    assert!(e.contains("error[K0321]") && e.contains("module.b.kms_key"), "{}", e);
+    mod_build(&format!(r#"{} (output "k" (:kms_key b) {{:sensitive true}})"#, body), false).unwrap_or_else(|e| panic!("{}", e));
+    let errs = mod_errors(&format!(r#"{} (defn never [] (output "k" (:kms_key b)))"#, body));
+    assert!(errs.iter().any(|e| e.contains("K0321")), "{}", errs.join("\n"));
+}
+
+#[test]
+fn a_module_without_a_cached_interface_warns_or_fails_when_strict() {
+    let body = r#"(module "x" {:source "./nowhere" :anything 1})"#;
+    let b = mod_build(body, false).unwrap_or_else(|e| panic!("{}", e));
+    assert!(b.warnings.iter().any(|w| w.contains("K0714") && w.contains("./nowhere")), "{:?}", b.warnings);
+    let e = mod_build(body, true).err().unwrap();
+    assert!(e.contains("error[K0714]"), "{}", e);
+}
+
+#[test]
+fn correct_module_calls_raise_nothing() {
+    let src = std::fs::read_to_string("examples/modules/main.kiln").unwrap();
+    let b = mod_build(&src.replace("(ns examples.modules\n  (:provider [google :as g :version \"~> 6.0\"]))", ""), true)
+        .unwrap_or_else(|e| panic!("{}", e));
+    assert!(b.warnings.is_empty() && b.type_clashes.is_empty(), "{:?} {:?}", b.warnings, b.type_clashes);
+    // module values built from a parameter: present fields checked, absent ones not guessed
+    let errs = mod_errors(r#"(defn mk [n extra] (module n (merge {:source "./bucket"} extra)))"#);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
+fn local_module_sources_are_written_relative_to_the_output() {
+    use kiln::schema::rebase_source;
+    use std::path::Path;
+    assert_eq!(rebase_source("./bucket", Path::new("examples/modules"), None), "../bucket");
+    assert_eq!(rebase_source("../shared/net", Path::new("stacks/dev"), None), "../../shared/net");
+    assert_eq!(rebase_source("./bucket", Path::new("stacks/dev"), Some(Path::new("stacks/dev/gen/tf"))), "../../bucket");
+    assert_eq!(rebase_source("./gen/m", Path::new("s"), Some(Path::new("s/gen"))), "./m");
+    let b = mod_build(r#"(module "b" {:source "./bucket" :name "x"})"#, false).unwrap();
+    assert!(b.json.contains("\"source\": \"../bucket\""), "{}", b.json);
+}
+
+#[test]
+fn kiln_schema_sees_module_sources_as_written() {
+    let src = std::fs::read_to_string("examples/modules/main.kiln").unwrap();
+    assert_eq!(kiln::modules_of(&src, "examples/modules/main.kiln"), vec![("./bucket".to_string(), None)]);
+}
+
+#[test]
+fn a_string_key_on_a_resource_picks_an_instance() {
+    let errs = stage_errors(
+        r#"(def sizes {"small" 4 "large" 8})
+           (def nets (for-each-deferred [s (tf/keys sizes)] (g/compute_network "net" {:name s})))
+           (def ok (:self_link (get nets "small")))
+           (defn bad [] (:self_lnk (get nets "small")))"#,
+    );
+    assert_eq!(errs.len(), 1, "{}", errs.join("\n"));
+    assert!(errs[0].contains("K0707") && errs[0].contains("self_lnk"), "{}", errs[0]);
 }

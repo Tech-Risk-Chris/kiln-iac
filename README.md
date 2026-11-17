@@ -11,10 +11,10 @@ day and keep the files.
 
 ## Status
 
-M0 to M2 are done: the language and its evaluator, address safety (`kiln.lock`,
-`moved` blocks, `kiln import`), and checking against provider schemas. M3 (types,
-staging, secrecy) has met its gate and has one step left, typed modules. Stacks and
-contexts, the replacement for Terragrunt, are M4. Details in [ROADMAP.md](ROADMAP.md).
+M0 to M3 are done: the language and its evaluator, address safety (`kiln.lock`,
+`moved` blocks, `kiln import`), checking against provider schemas and module
+interfaces, and static types for stages, secrets and shapes. Stacks and contexts, the
+replacement for Terragrunt, are M4. Details in [ROADMAP.md](ROADMAP.md).
 
 ## Use
 
@@ -92,6 +92,8 @@ that caused it:
   provider's schema: resource types, argument names at any depth (with spelling
   suggestions), required and read-only arguments, value types, nested blocks and how
   many of them. Also attribute reads, down into nested blocks.
+- **Module calls.** Inputs against the module's variables (names, required, types),
+  reads against its outputs; sensitive outputs are secrets.
 - **Stages.** No value known only after apply decides whether a resource exists, what
   is iterated, or what anything is called.
 - **Secrets.** No sensitive value reaches an argument, output, `count` or `for_each`
@@ -120,6 +122,13 @@ already have. The cache is committed, so builds need neither the engine nor the
 network. A provider without a cached schema is a warning, or an error with
 `--strict`. A cached schema whose version does not satisfy the stack's constraint is
 not used. One version per provider per repository, for now.
+
+Module interfaces live next to them in `.kiln/modules/`. The same `kiln schema` reads
+the variables and outputs of every module a stack calls: local modules straight from
+their `.tf` files, remote ones after installing them with the engine. They are
+committed too. A module without a cached interface is a warning (K0714), or an error
+with `--strict`. A local `:source` is written relative to the stack file; Kiln
+rewrites it relative to the output directory, where Terraform resolves it.
 
 ## Renaming without destroying
 
@@ -173,9 +182,11 @@ src/codes.rs      every diagnostic code, the source of ERRORS.md
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
 examples/deferred/        count-deferred and for-each-deferred
+examples/modules/         a local HCL module called with checked inputs and outputs
 examples/import-offline/  HCL fixture for the importer, credential-free providers
 tests/fixtures/move/      three versions of one stack for tools/move-test.sh
 .kiln/schemas/            cached provider schemas
+.kiln/modules/            cached module interfaces
 docs/M3.md                the M3 plan and its status
 ```
 

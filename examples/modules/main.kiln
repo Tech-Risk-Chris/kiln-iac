@@ -1,0 +1,35 @@
+;; Typed modules: calls to an HCL module are checked against its interface.
+;; Build:   kiln build examples/modules/main.kiln
+;; Refresh: kiln schema examples/modules/main.kiln
+;;
+;; `kiln schema` reads the module's variables and outputs (local modules
+;; directly, remote ones after `tofu init`) into .kiln/modules/. With that
+;; cache, an unknown or missing input, an input of the wrong type, or a read
+;; of an output the module does not declare is a compile error, and
+;; sensitive outputs are tracked as secrets.
+
+(ns examples.modules
+  (:provider [google :as g :version "~> 6.0"]))
+
+(provider g {:project "acme-dev" :region "europe-west3"})
+
+(def labels {:team "platform" :env "dev"})
+
+(defn bucket [name & {:keys [versioned] :or {versioned false}}]
+  (module name
+    {:source     "./bucket"
+     :name       (str "acme-dev-" name)
+     :labels     labels
+     :versioning {:enabled versioned}}))
+
+(def logs      (bucket "logs"))
+(def artifacts (bucket "artifacts" :versioned true))
+
+;; Outputs of a module are read like resource attributes, and checked.
+(g/storage_bucket_iam_member "artifacts-ci"
+  {:bucket (:name artifacts)
+   :role   "roles/storage.objectViewer"
+   :member "serviceAccount:ci@acme-dev.iam.gserviceaccount.com"})
+
+(output "log_bucket_url" (:url logs))
+(output "artifact_bucket_url" (:url artifacts))

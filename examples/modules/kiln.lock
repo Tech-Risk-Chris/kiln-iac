@@ -1,0 +1,9 @@
+{
+  "addresses": [
+    "google_storage_bucket_iam_member.artifacts-ci",
+    "module.artifacts",
+    "module.logs"
+  ],
+  "moved": [],
+  "version": 1
+}

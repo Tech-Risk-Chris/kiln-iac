@@ -47,12 +47,18 @@ impl ProviderSchema {
 pub struct SchemaSet {
     dir: Option<PathBuf>,
     loaded: RefCell<HashMap<String, Option<Rc<ProviderSchema>>>>,
+    modules: RefCell<HashMap<String, Option<Rc<ModuleInterface>>>>,
     errors: RefCell<Vec<String>>,
 }
 
 impl SchemaSet {
     pub fn empty() -> SchemaSet {
-        SchemaSet { dir: None, loaded: RefCell::new(HashMap::new()), errors: RefCell::new(vec![]) }
+        SchemaSet {
+            dir: None,
+            loaded: RefCell::new(HashMap::new()),
+            modules: RefCell::new(HashMap::new()),
+            errors: RefCell::new(vec![]),
+        }
     }
 
     pub fn from_dir(dir: PathBuf) -> SchemaSet {
@@ -357,4 +363,245 @@ pub fn satisfies(version: &str, constraint: &str) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+// ---------------------------------------------------------------- module interfaces
+//
+// A module's interface is its variables and outputs, read from its .tf files.
+// It is cached like a provider schema, under `.kiln/modules/`, in the shape of
+// a schema block so that the same checks apply: the inputs as a block whose
+// attributes are the variables, the outputs as a block of computed attributes.
+
+pub const MODULE_FORMAT: &str = "kiln-module/1";
+
+pub struct ModuleInterface {
+    pub key: String,
+    pub version: String,
+    pub inputs: Rc<J>,
+    pub outputs: Rc<J>,
+}
+
+impl ModuleInterface {
+    pub fn parse(text: &str) -> Result<ModuleInterface, String> {
+        let j: J = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {}", e))?;
+        if j["format"] != json!(MODULE_FORMAT) {
+            return Err(format!("unsupported format (this kiln reads {})", MODULE_FORMAT));
+        }
+        Ok(ModuleInterface {
+            key: j["key"].as_str().ok_or("missing \"key\"")?.to_string(),
+            version: j["version"].as_str().unwrap_or("").to_string(),
+            inputs: Rc::new(j["inputs"].clone()),
+            outputs: Rc::new(j["outputs"].clone()),
+        })
+    }
+}
+
+/// The cache key of a module source. Registry sources lose their host; local
+/// paths become paths relative to the directory that holds `.kiln`, so that
+/// stacks in different directories agree on them.
+pub fn module_key(source: &str, stack_dir: &Path, kiln_dir: Option<&Path>) -> String {
+    if source.starts_with("./") || source.starts_with("../") {
+        let abs = std::fs::canonicalize(stack_dir.join(source)).unwrap_or_else(|_| stack_dir.join(source));
+        let rel = kiln_dir
+            .and_then(|k| k.parent())
+            .map(|root| if root.as_os_str().is_empty() { Path::new(".") } else { root })
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .and_then(|root| abs.strip_prefix(&root).ok().map(|p| p.to_path_buf()))
+            .unwrap_or(abs);
+        return format!("local:{}", rel.to_string_lossy().replace('\\', "/"));
+    }
+    normalize_source(source)
+}
+
+/// A local module source, given relative to the stack, made relative to the
+/// output directory, where Terraform resolves it. Without an output directory,
+/// `out/` in the stack directory.
+pub fn rebase_source(source: &str, stack_dir: &Path, out_dir: Option<&Path>) -> String {
+    use std::path::Component;
+    fn absolute(p: &Path) -> Vec<String> {
+        let p = std::path::absolute(if p.as_os_str().is_empty() { Path::new(".") } else { p }).unwrap_or_else(|_| p.to_path_buf());
+        let mut parts: Vec<String> = vec![];
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                Component::Normal(x) => parts.push(x.to_string_lossy().into_owned()),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => parts.clear(),
+            }
+        }
+        parts
+    }
+    let out = match out_dir {
+        Some(o) => absolute(o),
+        None => absolute(&stack_dir.join("out")),
+    };
+    let target = absolute(&stack_dir.join(source));
+    let common = out.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut rel: Vec<String> = std::iter::repeat("..".to_string()).take(out.len() - common).collect();
+    rel.extend(target[common..].iter().cloned());
+    let joined = rel.join("/");
+    if joined.starts_with("..") { joined } else if joined.is_empty() { ".".into() } else { format!("./{}", joined) }
+}
+
+pub fn module_cache_path(modules_dir: &Path, key: &str) -> PathBuf {
+    let name: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    modules_dir.join(format!("{}.json", name))
+}
+
+impl SchemaSet {
+    /// The cached interface of a module, by key.
+    pub fn module(&self, key: &str) -> Option<Rc<ModuleInterface>> {
+        if let Some(m) = self.modules.borrow().get(key) {
+            return m.clone();
+        }
+        let found = self.dir.as_ref().and_then(|d| {
+            let path = module_cache_path(&d.parent()?.join("modules"), key);
+            let text = std::fs::read_to_string(&path).ok()?;
+            match ModuleInterface::parse(&text) {
+                Ok(m) => Some(Rc::new(m)),
+                Err(e) => {
+                    self.errors.borrow_mut().push(format!("{}: {}", path.display(), e));
+                    None
+                }
+            }
+        });
+        self.modules.borrow_mut().insert(key.to_string(), found.clone());
+        found
+    }
+
+    /// For tests and tools: add module interfaces given as cache-file texts.
+    pub fn add_module_texts(&self, texts: &[&str]) -> Result<(), String> {
+        for t in texts {
+            let m = ModuleInterface::parse(t)?;
+            self.modules.borrow_mut().insert(m.key.clone(), Some(Rc::new(m)));
+        }
+        Ok(())
+    }
+}
+
+/// An HCL type constraint, as the JSON type notation provider schemas use.
+pub fn type_of_expr(e: &hcl::Expression) -> J {
+    use hcl::Expression as E;
+    match e {
+        E::Variable(v) => match v.as_str() {
+            "string" | "number" | "bool" => json!(v.as_str()),
+            _ => json!("dynamic"), // any
+        },
+        E::FuncCall(f) => {
+            let name = f.name.name.as_str();
+            let arg = f.args.first();
+            match (name, arg) {
+                ("list" | "set" | "map", Some(a)) => json!([name, type_of_expr(a)]),
+                ("optional", Some(a)) => type_of_expr(a),
+                ("tuple", Some(E::Array(items))) => json!(["tuple", items.iter().map(type_of_expr).collect::<Vec<_>>()]),
+                ("object", Some(E::Object(obj))) => {
+                    let mut attrs = JMap::new();
+                    let mut optional = vec![];
+                    for (k, v) in obj.iter() {
+                        let key = k.to_string().trim_matches('"').to_string();
+                        if let E::FuncCall(g) = v {
+                            if g.name.name.as_str() == "optional" {
+                                optional.push(json!(key.clone()));
+                            }
+                        }
+                        attrs.insert(key, type_of_expr(v));
+                    }
+                    if optional.is_empty() {
+                        json!(["object", attrs])
+                    } else {
+                        json!(["object", attrs, optional])
+                    }
+                }
+                _ => json!("dynamic"),
+            }
+        }
+        _ => json!("dynamic"),
+    }
+}
+
+/// Read a module's interface from the .tf files in its directory.
+pub fn module_interface_from_dir(dir: &Path) -> Result<(J, J), String> {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read module {}: {}", dir.display(), e))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map_or(false, |x| x == "tf"))
+        .collect();
+    names.sort();
+    let mut vars = JMap::new();
+    let mut outs = JMap::new();
+    for p in names {
+        let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {}: {}", p.display(), e))?;
+        let body = hcl::parse(&text).map_err(|e| format!("{}: {}", p.display(), e))?;
+        for b in body.blocks() {
+            let label = match b.labels.first() {
+                Some(l) => l.as_str().to_string(),
+                None => continue,
+            };
+            let attr = |k: &str| b.body.attributes().find(|a| a.key.as_str() == k).map(|a| a.expr.clone());
+            let is_true = |k: &str| matches!(attr(k), Some(hcl::Expression::Bool(true)));
+            match b.identifier.as_str() {
+                "variable" => {
+                    let mut v = JMap::new();
+                    v.insert("type".into(), attr("type").map(|t| type_of_expr(&t)).unwrap_or(json!("dynamic")));
+                    if attr("default").is_some() {
+                        v.insert("optional".into(), json!(true));
+                    } else {
+                        v.insert("required".into(), json!(true));
+                    }
+                    if is_true("sensitive") {
+                        v.insert("sensitive".into(), json!(true));
+                    }
+                    vars.insert(label, J::Object(v));
+                }
+                "output" => {
+                    let mut o = JMap::new();
+                    o.insert("type".into(), json!("dynamic"));
+                    o.insert("computed".into(), json!(true));
+                    if is_true("sensitive") {
+                        o.insert("sensitive".into(), json!(true));
+                    }
+                    outs.insert(label, J::Object(o));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((json!({ "attributes": vars }), json!({ "attributes": outs })))
+}
+
+pub fn render_module_cache(key: &str, version: &str, inputs: &J, outputs: &J) -> String {
+    let mut s = serde_json::to_string_pretty(&json!({
+        "format": MODULE_FORMAT,
+        "key": key,
+        "version": version,
+        "inputs": inputs,
+        "outputs": outputs,
+    }))
+    .expect("JSON serialisation");
+    s.push('\n');
+    s
+}
+
+/// The modules a `.terraform/modules/modules.json` lists: key, source, version, directory.
+pub fn installed_modules(modules_json: &str) -> Result<Vec<(String, String, String, String)>, String> {
+    let j: J = serde_json::from_str(modules_json).map_err(|e| format!("modules.json: {}", e))?;
+    let mut out = vec![];
+    for m in j["Modules"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let key = m["Key"].as_str().unwrap_or("");
+        if key.is_empty() || key.contains('.') {
+            continue; // the root module, and modules nested inside modules
+        }
+        out.push((
+            key.to_string(),
+            m["Source"].as_str().unwrap_or("").to_string(),
+            m["Version"].as_str().unwrap_or("").to_string(),
+            m["Dir"].as_str().unwrap_or("").to_string(),
+        ));
+    }
+    Ok(out)
 }

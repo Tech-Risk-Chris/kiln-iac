@@ -155,6 +155,8 @@ pub struct Infer {
     locals: Vec<(String, Ty)>,
     blocks: HashMap<(String, bool), Option<Rc<J>>>,
     ctors: HashMap<String, String>,
+    /// Module sources resolved to their cached interfaces.
+    modules: HashMap<String, Option<Rc<crate::schema::ModuleInterface>>>,
     pos: Vec<Pos>,
     effects: Vec<u32>,
     pending: Vec<Pending>,
@@ -237,6 +239,7 @@ impl Infer {
             locals: vec![],
             blocks: HashMap::new(),
             ctors: HashMap::new(),
+            modules: HashMap::new(),
             pos: vec![],
             effects: vec![top],
             pending: vec![],
@@ -752,12 +755,25 @@ impl Infer {
             }
             Ty::Res(ty, d, name, _) => {
                 let desc = match &name {
+                    Some(n) if ty.starts_with("module ") => format!("`module.{}.{}`", n, k),
+                    None if ty.starts_with("module ") => format!("the output `{}` of a module", k),
                     Some(n) => format!("`{}{}.{}.{}`", if d { "data." } else { "" }, ty, n, k),
                     None => format!("`{}` of a {}", k, ty),
                 };
                 match self.res_attr(&ty, d, k, Some(desc.clone())) {
                     Some(t) => t,
                     None => {
+                        // a known schema without this attribute: the read is wrong
+                        if let Some(Some(block)) = self.blocks.get(&(ty.to_string(), d)).cloned() {
+                            let what = match (&name, ty.strip_prefix("module ")) {
+                                (Some(n), Some(_)) => format!("module.{}", n),
+                                (None, Some(_)) => "module".to_string(),
+                                (Some(n), None) => format!("{}{}.{}", if d { "data." } else { "" }, ty, n),
+                                (None, None) => format!("{}{}", if d { "data " } else { "" }, ty),
+                            };
+                            let help = crate::check::suggest(k, crate::check::readable(&block)).map(|s| format!("did you mean `{}`?", s));
+                            self.arg_error("K0707", &what, format!("has no attribute `{}`", k), help, None);
+                        }
                         let s = self.src(desc);
                         Ty::Dyn(s)
                     }
@@ -1276,10 +1292,7 @@ impl Infer {
                         None => self.dyn_(),
                     };
                 }
-                "module" => {
-                    self.declaration(&items[1..], None);
-                    return Ty::Module;
-                }
+                "module" => return self.infer_module(items),
                 "output" => {
                     let name = match items.get(1) {
                         Some(n) => {
@@ -1421,6 +1434,55 @@ impl Infer {
         literal
     }
 
+    /// A module call: its name is a declaration name, its inputs are checked
+    /// against the module's variables, and its outputs can be read.
+    fn infer_module(&mut self, items: &[Value]) -> Ty {
+        let literal = match items.get(1) {
+            Some(Value::Str(s)) if self.scope_depth == 0 => Some(s.clone()),
+            _ => None,
+        };
+        if let Some(n) = items.get(1) {
+            let t = self.infer(n);
+            self.sink(&t, K0314);
+        }
+        let mut merged = Fields::new();
+        let mut closed = true;
+        for f in &items[2.min(items.len())..] {
+            let t = self.infer(f);
+            match self.resolve(&t) {
+                Ty::Rec(fs, tail, _) => {
+                    closed &= tail == Tail::Closed;
+                    merged.extend(fs);
+                }
+                _ => closed = false,
+            }
+        }
+        self.emit_decl();
+        let source = match items.get(2) {
+            Some(Value::Map(m)) => match map_get(m, &Value::kw("source")) {
+                Some(Value::Str(s)) => Some(s.to_string()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let iface = source.as_ref().and_then(|s| self.modules.get(s).cloned().flatten());
+        let iface = match iface {
+            Some(i) => i,
+            None => return Ty::Module,
+        };
+        let what = match &literal {
+            Some(n) => format!("module.{}", n),
+            None => "module".to_string(),
+        };
+        let tail = if closed { Tail::Closed } else { self.fresh_row() };
+        let a = self.ann();
+        let inputs = (*iface.inputs).clone();
+        self.check_args(&inputs, &Ty::Rec(merged, tail, a), &what, "", crate::check::MODULE_META);
+        let ty = format!("module {}", iface.key);
+        self.blocks.insert((ty.clone(), false), Some(iface.outputs.clone()));
+        Ty::Res(ty, false, literal, self.inst_kind())
+    }
+
     fn arg_error(&mut self, code: &'static str, what: &str, msg: String, help: Option<String>, stage: Option<u32>) {
         let pos = self.pos.last().copied();
         let e = StageError { code, msg: format!("{}: {}", what, msg), help: help.unwrap_or_default(), pos };
@@ -1549,6 +1611,33 @@ impl Infer {
             },
             (J::String(x), Ty::Vec(..) | Ty::Map(..) | Ty::Rec(..)) => x == "string" || x == "number" || x == "bool",
             (J::Array(a), Ty::P(..)) => matches!(a.first().and_then(|k| k.as_str()), Some("list" | "set" | "map" | "object")),
+            // the attributes of an object type, and the elements of collections
+            (J::Array(a), Ty::Rec(fs, _, _)) if a.first().and_then(|k| k.as_str()) == Some("object") => {
+                if let Some(J::Object(attrs)) = a.get(1) {
+                    for (k, (ft, _)) in fs {
+                        if let Some(at) = attrs.get(k) {
+                            let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
+                            self.check_type(at, ft, what, &p);
+                        }
+                    }
+                }
+                false
+            }
+            (J::Array(a), Ty::Vec(e, _)) if matches!(a.first().and_then(|k| k.as_str()), Some("list" | "set")) => {
+                if let Some(et) = a.get(1) {
+                    let p = format!("{}[*]", path);
+                    self.check_type(et, &e, what, &p);
+                }
+                false
+            }
+            // a vector is never a map or an object
+            (J::Array(a), Ty::Vec(..)) => matches!(a.first().and_then(|k| k.as_str()), Some("map" | "object")),
+            (J::Array(a), Ty::Map(v, _)) if a.first().and_then(|k| k.as_str()) == Some("map") => {
+                if let Some(vt) = a.get(1) {
+                    self.check_type(vt, &v, what, &format!("{}[*]", path));
+                }
+                false
+            }
             _ => false,
         };
         if wrong {
@@ -1744,6 +1833,8 @@ impl Infer {
             }
             "get" => {
                 let t = match (self.resolve(&arg(0)), args.get(1)) {
+                    // a string or number key on a resource picks an instance, as in the evaluator
+                    (Ty::Res(ty, d, name, _), Some(Value::Str(_) | Value::Int(_))) => Ty::Res(ty, d, name, 0),
                     (_, Some(Value::Keyword(k))) | (_, Some(Value::Str(k))) => self.field(&arg(0), k),
                     (Ty::Vec(e, _), _) => *e,
                     (Ty::Map(v, _), _) => *v,
@@ -1856,6 +1947,19 @@ impl Infer {
                         self.ctors.insert(s.to_string(), ty);
                     }
                 }
+            }
+            Value::List(items, _) if items.first().and_then(|h| h.sym_name()) == Some("module") => {
+                if let Some(Value::Map(m)) = items.get(2) {
+                    if let Some(Value::Str(src)) = map_get(m, &Value::kw("source")) {
+                        let version = match map_get(m, &Value::kw("version")) {
+                            Some(Value::Str(v)) => Some(v.to_string()),
+                            _ => None,
+                        };
+                        let (iface, _) = it.module_interface(&src, version.as_deref());
+                        self.modules.insert(src.to_string(), iface);
+                    }
+                }
+                items.iter().for_each(|i| self.learn_ctors(it, i));
             }
             Value::List(items, _) | Value::Vector(items) => items.iter().for_each(|i| self.learn_ctors(it, i)),
             Value::Map(entries) => entries.iter().for_each(|(k, v)| {

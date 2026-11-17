@@ -26,7 +26,8 @@ USAGE:
                          deletions and creations instead of stopping
               --strict   a provider without a cached schema is an error
     schema    Fetch the schemas of the providers a stack declares, using the engine
-              ($TOFU, default `tofu`), into .kiln/schemas/. With --from, convert
+              ($TOFU, default `tofu`), into .kiln/schemas/, and the interfaces of
+              its modules into .kiln/modules/ (local modules are read directly). With --from, convert
               the output of `tofu providers schema -json` instead.
     import    Translate the .tf files in a directory into <dir>/main.kiln, then build
               it. Addresses are preserved.
@@ -127,6 +128,7 @@ fn schemas_for(file: &Path) -> Rc<SchemaSet> {
 
 fn build(file: &Path, out: Option<PathBuf>, check: bool, replace: bool, strict: bool) -> Result<(), String> {
     let src = read(file)?;
+    let explicit_out = out.clone();
     let dir = out.unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("out"));
     let target = dir.join("main.tf.json");
     let lockfile = lock_path(file);
@@ -141,6 +143,7 @@ fn build(file: &Path, out: Option<PathBuf>, check: bool, replace: bool, strict: 
             accept_replace: replace,
             schemas: Some(schemas_for(file)),
             strict,
+            out_dir: explicit_out,
         },
     )?;
     for w in &b.warnings {
@@ -251,17 +254,36 @@ fn schema_cmd(a: &Args) -> Result<(), String> {
     };
     let src = read(&file)?;
     let providers = kiln::providers_of(&src, &shown(&file))?;
-    if providers.is_empty() {
-        println!("{} declares no providers", shown(&file));
+    let modules = kiln::modules_of(&src, &shown(&file));
+    if providers.is_empty() && modules.is_empty() {
+        println!("{} declares no providers and no modules", shown(&file));
         return Ok(());
     }
-    let kiln_dir = schema::default_kiln_dir(dir_of(&file));
+    let stack_dir = dir_of(&file).to_path_buf();
+    let kiln_dir = schema::default_kiln_dir(&stack_dir);
     let cache = kiln_dir.join("schemas");
-    if a.if_missing && providers.iter().all(|(_, s, _)| schema::cache_path(&cache, s).exists()) {
+    let module_cache = kiln_dir.join("modules");
+    let key_of = |source: &str| schema::module_key(source, &stack_dir, Some(&kiln_dir));
+    let is_local = |source: &str| source.starts_with("./") || source.starts_with("../");
+
+    // Local modules are read straight from disk; no engine needed.
+    for (source, _) in modules.iter().filter(|(s, _)| is_local(s)) {
+        let key = key_of(source);
+        let (inputs, outputs) = schema::module_interface_from_dir(&stack_dir.join(source))?;
+        let path = schema::module_cache_path(&module_cache, &key);
+        write(&path, &schema::render_module_cache(&key, "", &inputs, &outputs))?;
+        println!("wrote {} ({})", shown(&path), key);
+    }
+
+    // Providers and remote modules come from the engine.
+    let remote: Vec<&(String, Option<String>)> = modules.iter().filter(|(s, _)| !is_local(s)).collect();
+    let providers_cached = providers.iter().all(|(_, s, _)| schema::cache_path(&cache, s).exists());
+    let modules_cached = remote.iter().all(|(s, _)| schema::module_cache_path(&module_cache, &key_of(s)).exists());
+    if providers_cached && modules_cached && (a.if_missing || (providers.is_empty() && remote.is_empty())) {
         println!("schemas for {} are cached", shown(&file));
         return Ok(());
     }
-    // A configuration that only declares the providers: no resources, no backend.
+    // A configuration that only declares the providers and installs the modules.
     let mut rp = serde_json::Map::new();
     for (name, source, version) in &providers {
         let mut p = serde_json::Map::new();
@@ -271,15 +293,48 @@ fn schema_cmd(a: &Args) -> Result<(), String> {
         }
         rp.insert(name.clone(), serde_json::Value::Object(p));
     }
+    let mut mods = serde_json::Map::new();
+    for (i, (source, version)) in remote.iter().enumerate() {
+        let mut m = serde_json::Map::new();
+        m.insert("source".into(), source.clone().into());
+        if let Some(v) = version {
+            m.insert("version".into(), v.clone().into());
+        }
+        mods.insert(format!("m{}", i), serde_json::Value::Object(m));
+    }
     let work = kiln_dir.join("work").join("schema");
     let _ = std::fs::remove_file(work.join(".terraform.lock.hcl"));
-    let config = serde_json::json!({ "terraform": { "required_providers": rp } });
+    let mut config = serde_json::json!({ "terraform": { "required_providers": rp } });
+    if !mods.is_empty() {
+        config["module"] = serde_json::Value::Object(mods);
+    }
     write(&work.join("main.tf.json"), &serde_json::to_string_pretty(&config).unwrap())?;
-    println!("fetching provider schemas with the engine in {}", shown(&work));
+    println!("fetching schemas with the engine in {}", shown(&work));
     engine(&work, &["init", "-backend=false", "-input=false", "-no-color", "-upgrade"])?;
-    let schema_json = engine(&work, &["providers", "schema", "-json"])?;
-    let lock = read(&work.join(".terraform.lock.hcl"))?;
-    write_schemas(&cache, &schema_json, &lock)
+    if !providers.is_empty() {
+        let schema_json = engine(&work, &["providers", "schema", "-json"])?;
+        let lock = read(&work.join(".terraform.lock.hcl"))?;
+        write_schemas(&cache, &schema_json, &lock)?;
+    }
+    if !remote.is_empty() {
+        let listing = read(&work.join(".terraform").join("modules").join("modules.json"))?;
+        for (key, _src, version, dir) in schema::installed_modules(&listing)? {
+            let i: usize = match key.strip_prefix('m').and_then(|n| n.parse().ok()) {
+                Some(i) => i,
+                None => continue,
+            };
+            let (source, _) = match remote.get(i) {
+                Some(r) => r,
+                None => continue,
+            };
+            let mkey = key_of(source);
+            let (inputs, outputs) = schema::module_interface_from_dir(&work.join(&dir))?;
+            let path = schema::module_cache_path(&module_cache, &mkey);
+            write(&path, &schema::render_module_cache(&mkey, &version, &inputs, &outputs))?;
+            println!("wrote {} ({} {})", shown(&path), mkey, version);
+        }
+    }
+    Ok(())
 }
 
 fn mv(file: &Path, from: &str, to: &str) -> Result<(), String> {
