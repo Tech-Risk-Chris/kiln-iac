@@ -1,7 +1,10 @@
 use kiln::{compile, eval_last, expand};
 
 fn ev(src: &str) -> String {
-    eval_last(src).unwrap_or_else(|e| panic!("{}", e))
+    let out = eval_last(src).unwrap_or_else(|e| panic!("{}", e));
+    let r = kiln::types(src, "t.kiln", None).unwrap();
+    assert!(r.clashes.is_empty(), "false type error in valid code:\n{}\n{}", src, r.clashes.join("\n"));
+    out
 }
 
 fn err(src: &str) -> String {
@@ -15,7 +18,9 @@ const NS: &str = "(ns t (:provider [google :as g :version \"~> 6.0\"]))\n";
 
 fn stack(body: &str) -> serde_json::Value {
     let src = format!("{}{}", NS, body);
-    let out = compile(&src, "t.kiln").unwrap_or_else(|e| panic!("{}", e));
+    let b = kiln::build(&src, "t.kiln", &kiln::BuildOpts::default()).unwrap_or_else(|e| panic!("{}", e));
+    assert!(b.type_clashes.is_empty(), "false type error in valid code:\n{}\n{}", src, b.type_clashes.join("\n"));
+    let out = b.json;
     serde_json::from_str(&out).unwrap()
 }
 

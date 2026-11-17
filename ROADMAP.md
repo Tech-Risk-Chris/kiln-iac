@@ -7,7 +7,7 @@ Milestones are ordered so that the adoption-critical parts (output shape, addres
 | M0 Core | Done | Met: the hand-written GKE example plans identically to its HCL original |
 | M1 Address safety | Done | Met on the repository's fixtures; a real client repository is still to try |
 | M2 Schema checking | Done | Met: every mistake in a seeded corpus of 20 is caught before Terraform runs |
-| M3 Types, staging, secrecy | In progress: 2 of 7 steps | |
+| M3 Types, staging, secrecy | In progress: 3 of 7 steps | |
 | M4 Stacks and contexts | | |
 | M5 Hardening | | |
 
@@ -40,7 +40,7 @@ This replaced the original M2 ("types"). Checking the evaluated graph gives user
 - Structural recursion, which the type checker can verify.
 - Typed module inputs and outputs.
 
-Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, and structural self-recursion.
+Decided: a sound core (stage, secrecy, effect) with a gradual penumbra (shapes). Plan and step status: [docs/M3.md](docs/M3.md). Done so far: secrecy tracking during evaluation, structural self-recursion, and gradual shape inference that runs in every build but does not report yet.
 
 **Gate:** the corpus of known `for_each` and `count` plan-time failures becomes compile errors, including in code paths that do not run.
 

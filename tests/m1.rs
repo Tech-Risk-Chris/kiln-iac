@@ -11,7 +11,9 @@ fn b(body: &str, lock: Option<&str>) -> Result<Build, String> {
 }
 
 fn ok(body: &str, lock: Option<&str>) -> Build {
-    b(body, lock).unwrap_or_else(|e| panic!("{}", e))
+    let r = b(body, lock).unwrap_or_else(|e| panic!("{}", e));
+    assert!(r.type_clashes.is_empty(), "false type error:\n{}\n{}", body, r.type_clashes.join("\n"));
+    r
 }
 
 fn moved(build: &Build) -> Vec<(String, String)> {

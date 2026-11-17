@@ -21,6 +21,7 @@ fn examples_match_committed_output() {
         };
         let b = kiln::build(&src, &shown, &opts).unwrap_or_else(|e| panic!("{}", e));
         assert!(b.warnings.is_empty(), "{}", b.warnings.join("\n"));
+        assert!(b.type_clashes.is_empty(), "{}: false type errors:\n{}", shown, b.type_clashes.join("\n"));
         assert_eq!(Some(b.lock.as_str()), lock.as_deref(), "{}: kiln.lock is stale", shown);
         let got = b.json;
         let want = std::fs::read_to_string(dir.join("out/main.tf.json"))

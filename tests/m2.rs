@@ -17,7 +17,9 @@ fn with_ns(ns: &str, body: &str) -> Result<Build, String> {
 const G: &str = "(ns t (:provider [google :as g :version \"~> 6.0\"]))";
 
 fn ok(body: &str) -> Build {
-    with_ns(G, body).unwrap_or_else(|e| panic!("{}", e))
+    let b = with_ns(G, body).unwrap_or_else(|e| panic!("{}", e));
+    assert!(b.type_clashes.is_empty(), "false type error:\n{}\n{}", body, b.type_clashes.join("\n"));
+    b
 }
 
 fn err(body: &str) -> String {

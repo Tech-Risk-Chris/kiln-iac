@@ -1199,6 +1199,25 @@ impl Interp {
         Ok(Value::Handle(Rc::new(h)))
     }
 
+    // ------------------------------------------------------------ for the type checker
+
+    /// The Terraform type a namespaced constructor symbol such as `g/compute_network` names.
+    pub fn ctor_type(&self, sym: &str) -> Option<String> {
+        let (ns, name) = sym.split_once('/')?;
+        let p = self.aliases.get(ns)?;
+        Some(format!("{}_{}", self.providers[p].prefix, name))
+    }
+
+    /// The cached schema block of a resource or data source type, without
+    /// reporting anything when there is none.
+    pub fn peek_schema(&self, data: bool, ty: &str) -> Option<Rc<J>> {
+        let set = self.schemas.as_ref()?;
+        let name = self.provider_of(ty)?;
+        let ps = set.get(&self.providers.get(&name)?.source)?;
+        let table = if data { &ps.data_sources } else { &ps.resources };
+        table.get(ty).cloned()
+    }
+
     // ------------------------------------------------------------ schemas
 
     fn current_pos(&self) -> Option<Pos> {

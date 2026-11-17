@@ -15,6 +15,7 @@ USAGE:
     kiln import <dir> -o <dir> [--force]
     kiln mv <file.kiln> <from-address> <to-address>
     kiln expand <file.kiln>
+    kiln types <file.kiln>
     kiln --version
 
     build     Compile a stack to <dir>/main.tf.json (default: out/ beside the source)
@@ -30,6 +31,8 @@ USAGE:
               it. Addresses are preserved.
     mv        Declare that a resource was renamed; the next build emits a `moved` block.
     expand    Print the program with all macros expanded.
+    types     Print the inferred type of every top-level definition, and the type
+              errors the checker would report (it does not report them yet).
 ";
 
 fn read(p: &Path) -> Result<String, String> {
@@ -309,6 +312,21 @@ fn real_main(args: Vec<String>) -> Result<(), String> {
         ("expand", 1) => {
             let file = p(0).unwrap();
             print!("{}", kiln::expand(&read(&file)?, &shown(&file))?);
+            Ok(())
+        }
+        ("types", 1) => {
+            let file = p(0).unwrap();
+            let r = kiln::types(&read(&file)?, &shown(&file), Some(schemas_for(&file)))?;
+            let width = r.defs.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            for (n, t) in &r.defs {
+                println!("{:width$}  {}", n, t, width = width);
+            }
+            if !r.clashes.is_empty() {
+                println!("\n{} type error{} the checker would report:\n", r.clashes.len(), if r.clashes.len() == 1 { "" } else { "s" });
+                for c in &r.clashes {
+                    print!("{}", c);
+                }
+            }
             Ok(())
         }
         ("import", 1) => import(&p(0).unwrap(), a.out, a.force),

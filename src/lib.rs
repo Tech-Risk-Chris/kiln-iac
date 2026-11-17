@@ -5,6 +5,7 @@ pub mod check;
 pub mod emit;
 pub mod eval;
 pub mod import;
+pub mod infer;
 pub mod ledger;
 pub mod reader;
 pub mod recursion;
@@ -28,6 +29,9 @@ pub struct Build {
     pub new_moves: Vec<ledger::Move>,
     /// Rendered warnings: deprecated arguments, providers without a schema.
     pub warnings: Vec<String>,
+    /// Clashes the type checker found. Not reported yet (M3 step 3): the
+    /// checker must first accept all valid code.
+    pub type_clashes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -57,9 +61,11 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     it.schemas = opts.schemas.clone();
     let mut errors: Vec<String> = vec![];
     let mut fatal = None;
+    let mut ty = infer::Infer::new();
     match reader::read_all(src) {
         Ok(forms) => {
             for form in forms {
+                ty.toplevel(&mut it, &form);
                 if let Err(e) = it.eval_toplevel(&form) {
                     fatal = Some(e);
                     break;
@@ -101,7 +107,39 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     let (ledger, new_moves) =
         ledger::reconcile(old.as_ref(), &it.graph, opts.old_output, opts.accept_replace)
             .map_err(|m| format!("{}  --> {}\n", m, file))?;
-    Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves, warnings })
+    let type_clashes = render_clashes(&ty, file, src);
+    Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves, warnings, type_clashes })
+}
+
+fn render_clashes(ty: &infer::Infer, file: &str, src: &str) -> Vec<String> {
+    ty.clashes
+        .iter()
+        .map(|c| KilnError { code: "T", msg: c.msg.clone(), pos: c.pos, help: None }.render_as("type", file, src))
+        .collect()
+}
+
+/// What the type checker infers for a stack: the type of each top-level
+/// definition, and the clashes it would report.
+pub struct TypeReport {
+    pub defs: Vec<(String, String)>,
+    pub clashes: Vec<String>,
+}
+
+pub fn types(src: &str, file: &str, schemas: Option<std::rc::Rc<schema::SchemaSet>>) -> Result<TypeReport, String> {
+    let mut it = eval::Interp::new().map_err(|e| e.render(file, src))?;
+    it.schemas = schemas;
+    let mut ty = infer::Infer::new();
+    let forms = reader::read_all(src).map_err(|e| e.render(file, src))?;
+    for form in forms {
+        ty.toplevel(&mut it, &form);
+        // Evaluation keeps macros and providers current for the next form;
+        // its own errors are not the subject here.
+        if it.eval_toplevel(&form).is_err() {
+            break;
+        }
+    }
+    let defs = ty.defs.iter().map(|(n, t)| (n.clone(), ty.show(t))).collect();
+    Ok(TypeReport { defs, clashes: render_clashes(&ty, file, src) })
 }
 
 /// The providers a stack declares in its `ns` form: (name, source, version constraint).

@@ -158,3 +158,143 @@ fn recursion_without_a_base_case_stops_at_run_time() {
 fn a_local_name_that_shadows_the_function_is_not_recursion() {
     assert_eq!(eval_last("(defn f [xs] (let [f count] (f xs))) (f [1 2 3])").unwrap(), "3");
 }
+
+// ------------------------------------------------------------------ inference (step 3)
+
+fn types(src: &str) -> kiln::TypeReport {
+    let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+    kiln::types(src, "t.kiln", Some(schemas)).unwrap_or_else(|e| panic!("{}", e))
+}
+
+fn ty_of(src: &str, name: &str) -> String {
+    let r = types(src);
+    r.defs.iter().find(|(n, _)| n == name).map(|(_, t)| t.clone()).unwrap_or_else(|| panic!("no {} in {:?}", name, r.defs))
+}
+
+fn clashes(src: &str) -> Vec<String> {
+    types(src).clashes
+}
+
+const G: &str = "(ns t (:provider [google :as g :version \"~> 6.0\"]))\n";
+
+/// Idiomatic code that must type-check without a single clash.
+const IDIOMS: &[&str] = &[
+    // maps whose keys differ in one vector; optional keys read with a default
+    r#"(def pools [{:name "a" :min 1} {:name "b" :min 0 :spot true}])
+       (def spots (for [p pools] (get p :spot false)))"#,
+    // nil as absence, when inside a map, merge
+    r#"(defn labels [ctx extra] (merge {:env (:env ctx) :managed_by "kiln"} extra))
+       (def l (labels {:env "dev"} {:team "x"}))
+       (def m {:a 1 :b (when false "x")})"#,
+    // heterogeneous vectors and pairs from a map
+    r#"(def pair ["a" 1])
+       (def kv (for [[k v] {:a 1 :b 2}] (str (name k) "=" v)))"#,
+    // a helper used at two different types
+    r#"(defn twice [x] [x x])
+       (def a (twice 1))
+       (def b (twice "s"))"#,
+    // keyword arguments and variadic functions
+    r#"(defn f [x & {:keys [y]}] [x y])
+       (def r (f 1 :y 2))
+       (defn g [& xs] (count xs))
+       (def n (g 1 2 3))"#,
+    // higher-order functions
+    r#"(def total (reduce + 0 (map inc [1 2 3])))
+       (def names (map (fn [p] (:name p)) [{:name "a"} {:name "b"}]))
+       (def big (filter (fn [x] (> x 1)) [1 2 3]))"#,
+    // recursion
+    r#"(defn names [node] (concat [(:name node)] (mapcat names (:children node))))
+       (def all (names {:name "r" :children [{:name "a" :children []}]}))"#,
+    // macros and components
+    r#"(defmacro unless [c & body] `(if ~c nil (do ~@body)))
+       (def u (unless false 1))
+       (defcomponent net [ctx] (g/compute_network "vpc" {:name (:env ctx)}))
+       (def n (net "a" {:env "dev"}))
+       (def id (:id n))"#,
+    // resource attributes into strings, deferred arithmetic, Terraform functions
+    r#"(def vpc (g/compute_network "vpc" {:name "v"}))
+       (def s (g/compute_subnetwork "s" {:name (str (:name vpc) "-s") :network (:id vpc)
+                                         :region "r" :ip_cidr_range (tf/cidrsubnet "10.0.0.0/16" 8 1)}))
+       (def mtu (+ (:mtu vpc) 1))
+       (output "link" (:self_link vpc))"#,
+    // nested blocks read through their schema
+    r#"(def c (g/container_cluster "c" {:name "c" :location "l"}))
+       (def ca (:cluster_ca_certificate (get (:master_auth c) 0)))"#,
+];
+
+#[test]
+fn idiomatic_code_has_no_type_errors() {
+    let mut bad = vec![];
+    for snippet in IDIOMS {
+        let src = format!("{}{}", G, snippet);
+        let c = clashes(&src);
+        if !c.is_empty() {
+            bad.push(format!("{}\n{}", snippet, c.join("\n")));
+        }
+    }
+    assert!(bad.is_empty(), "false type errors:\n\n{}", bad.join("\n\n"));
+}
+
+#[test]
+fn examples_fixtures_and_imports_have_no_type_errors() {
+    let mut sources = vec![("examples/gke/main.kiln".to_string(), std::fs::read_to_string("examples/gke/main.kiln").unwrap())];
+    for v in ["v1", "v2", "v3"] {
+        let p = format!("tests/fixtures/move/{}.kiln", v);
+        sources.push((p.clone(), std::fs::read_to_string(&p).unwrap()));
+    }
+    for dir in ["examples/gke/original", "examples/import-offline/original"] {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().map_or(false, |x| x == "tf"))
+            .collect();
+        files.sort();
+        let files: Vec<(String, String)> =
+            files.iter().map(|p| (p.display().to_string(), std::fs::read_to_string(p).unwrap())).collect();
+        sources.push((format!("import of {}", dir), kiln::import::import(&files, dir).unwrap().source));
+    }
+    for (name, src) in sources {
+        let c = clashes(&src);
+        assert!(c.is_empty(), "{}: false type errors:\n{}", name, c.join("\n"));
+    }
+}
+
+#[test]
+fn inferred_types_are_readable() {
+    let src = format!(
+        "{}{}",
+        G,
+        r#"(defn labels [ctx extra] (merge {:env (:env ctx)} extra))
+           (defn port [svc] (+ (:base svc) 80))
+           (def vpc (g/compute_network "vpc" {:name "v"}))
+           (def info {:name (:name vpc) :link (:self_link vpc)})"#
+    );
+    assert_eq!(ty_of(&src, "port"), "(Fn [{:base? Num, & r0}] Num)");
+    assert_eq!(ty_of(&src, "vpc"), "google_compute_network");
+    assert_eq!(ty_of(&src, "info"), "{:link Str, :name Str}");
+    assert!(ty_of(&src, "labels").starts_with("(Fn [{:env? a, & r1} "), "{}", ty_of(&src, "labels"));
+}
+
+/// Mistakes the checker finds, here all in code that no build would run.
+#[test]
+fn clashes_are_found_in_code_that_never_runs() {
+    let cases: &[(&str, &str)] = &[
+        (r#"(defn f [x] (+ x 1)) (def y (if false (f "a") 0))"#, "argument 1 of `f`"),
+        (r#"(defn f [a b] a) (defn never [] (f 1))"#, "`f` takes 2 arguments, got 1"),
+        (r#"(defn never [] (:k 5))"#, "cannot look up :k in Num"),
+        (r#"(defn never [] (for [x 5] x))"#, "Num is not a collection"),
+        (r#"(defn never [] (+ 1 "a"))"#, "argument 2 of `+`"),
+        (r#"(def vpc (g/compute_network "vpc" {:name "v"})) (defn never [] (+ (:name vpc) 1))"#, "argument 1 of `+`: Str"),
+        (r#"(def cfg {:port 80}) (defn never [] (str (count (:port cfg))))"#, "Num is not a collection"),
+        (r#"(defn never [] (5 1))"#, "Num is not a function"),
+    ];
+    for (snippet, want) in cases {
+        let src = format!("{}{}", G, snippet);
+        let c = clashes(&src);
+        assert!(c.iter().any(|m| m.contains(want)), "{}\nwanted a clash containing {:?}, got:\n{}", snippet, want, c.join("\n"));
+        // and none of these stops the build yet
+        let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+        let built = build(&src, "t.kiln", &BuildOpts { schemas: Some(schemas), ..BuildOpts::default() });
+        assert!(built.is_ok(), "{}: {}", snippet, built.err().unwrap());
+    }
+}

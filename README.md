@@ -10,7 +10,8 @@ Design: [DESIGN.md](DESIGN.md). Milestones and status: [ROADMAP.md](ROADMAP.md).
 
 M0 (reader, evaluator, macros, emitter), M1 (address ledger, `moved` blocks,
 `kiln import`) and M2 (checking against provider schemas) are done. Of M3, secrecy
-tracking and structural recursion are done; see [ROADMAP.md](ROADMAP.md).
+tracking, structural recursion and (silent) type inference are done; see
+[ROADMAP.md](ROADMAP.md).
 
 | Done | Not yet |
 | --- | --- |
@@ -31,6 +32,7 @@ kiln schema examples/gke/main.kiln           # cache provider schemas (runs tofu
 kiln build examples/gke/main.kiln            # writes out/main.tf.json and kiln.lock
 kiln build examples/gke/main.kiln --check --strict   # CI
 kiln expand examples/gke/main.kiln           # program with macros expanded
+kiln types examples/gke/main.kiln            # inferred types (errors not enforced yet)
 kiln import path/to/terraform -o path/to/stack
 kiln mv stack/main.kiln google_x.old google_x.new
 
@@ -164,6 +166,7 @@ src/import.rs     HCL -> Kiln
 src/schema.rs     schema cache, conversion, version constraints
 src/check.rs      checking declarations against schemas, secret flows
 src/recursion.rs  the structural recursion check
+src/infer.rs      gradual type inference
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
 examples/import-offline/  HCL fixture for the importer, credential-free providers
