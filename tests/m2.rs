@@ -165,10 +165,11 @@ fn deprecated_arguments_warn_but_build() {
 
 #[test]
 fn providers_without_a_schema_warn_or_fail_when_strict() {
-    let ns = "(ns t (:provider [random :as r :version \"~> 3.6\"]))";
-    let b = with_ns(ns, "(r/pet \"p\" {:lenght 2})").unwrap();
-    assert!(b.warnings.iter().any(|w| w.contains("warning[K0712]") && w.contains("hashicorp/random")), "{:?}", b.warnings);
-    let src = format!("{}\n(r/pet \"p\" {{}})\n", ns);
+    // A provider that is never in the cache, whatever `kiln schema` has fetched.
+    let ns = "(ns t (:provider [acme :as a :source \"example/acme\" :version \"~> 1.0\"]))";
+    let b = with_ns(ns, "(a/widget \"w\" {:colour 2})").unwrap();
+    assert!(b.warnings.iter().any(|w| w.contains("warning[K0712]") && w.contains("example/acme")), "{:?}", b.warnings);
+    let src = format!("{}\n(a/widget \"w\" {{}})\n", ns);
     let e = build(&src, "t.kiln", &BuildOpts { schemas: Some(google()), strict: true, ..BuildOpts::default() })
         .err()
         .unwrap();
