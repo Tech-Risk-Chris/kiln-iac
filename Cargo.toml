@@ -3,6 +3,7 @@ name = "kiln"
 version = "0.1.0"
 edition = "2021"
 description = "A Lisp that compiles to Terraform JSON"
+license = "MIT"
 
 [dependencies]
 hcl-rs = "0.20.0"

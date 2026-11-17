@@ -159,3 +159,7 @@ examples/import-offline/  HCL fixture for the importer, credential-free provider
 tests/fixtures/move/      three versions of one stack for tools/move-test.sh
 .kiln/schemas/            cached provider schemas (Google 6.50.0)
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
