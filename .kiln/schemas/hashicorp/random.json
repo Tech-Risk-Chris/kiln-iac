@@ -1,0 +1,19 @@
+{
+  "format": "kiln-schema/1",
+  "source": "hashicorp/random",
+  "version": "3.9.1",
+  "provider": {},
+  "resources": {
+    "random_bytes": {"attributes":{"base64":{"computed":true,"sensitive":true,"type":"string"},"hex":{"computed":true,"sensitive":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"length":{"required":true,"type":"number"}}},
+    "random_id": {"attributes":{"b64_std":{"computed":true,"type":"string"},"b64_url":{"computed":true,"type":"string"},"byte_length":{"required":true,"type":"number"},"dec":{"computed":true,"type":"string"},"hex":{"computed":true,"type":"string"},"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"prefix":{"optional":true,"type":"string"}}},
+    "random_integer": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"max":{"required":true,"type":"number"},"min":{"required":true,"type":"number"},"result":{"computed":true,"type":"number"},"seed":{"optional":true,"type":"string"}}},
+    "random_password": {"attributes":{"bcrypt_hash":{"computed":true,"sensitive":true,"type":"string"},"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"length":{"required":true,"type":"number"},"lower":{"computed":true,"optional":true,"type":"bool"},"min_lower":{"computed":true,"optional":true,"type":"number"},"min_numeric":{"computed":true,"optional":true,"type":"number"},"min_special":{"computed":true,"optional":true,"type":"number"},"min_upper":{"computed":true,"optional":true,"type":"number"},"number":{"computed":true,"deprecated":true,"optional":true,"type":"bool"},"numeric":{"computed":true,"optional":true,"type":"bool"},"override_special":{"optional":true,"type":"string"},"result":{"computed":true,"sensitive":true,"type":"string"},"special":{"computed":true,"optional":true,"type":"bool"},"upper":{"computed":true,"optional":true,"type":"bool"}}},
+    "random_pet": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"length":{"computed":true,"optional":true,"type":"number"},"prefix":{"optional":true,"type":"string"},"separator":{"computed":true,"optional":true,"type":"string"}}},
+    "random_shuffle": {"attributes":{"id":{"computed":true,"type":"string"},"input":{"required":true,"type":["list","string"]},"keepers":{"optional":true,"type":["map","string"]},"result":{"computed":true,"type":["list","string"]},"result_count":{"optional":true,"type":"number"},"seed":{"optional":true,"type":"string"}}},
+    "random_string": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"length":{"required":true,"type":"number"},"lower":{"computed":true,"optional":true,"type":"bool"},"min_lower":{"computed":true,"optional":true,"type":"number"},"min_numeric":{"computed":true,"optional":true,"type":"number"},"min_special":{"computed":true,"optional":true,"type":"number"},"min_upper":{"computed":true,"optional":true,"type":"number"},"number":{"computed":true,"deprecated":true,"optional":true,"type":"bool"},"numeric":{"computed":true,"optional":true,"type":"bool"},"override_special":{"optional":true,"type":"string"},"result":{"computed":true,"type":"string"},"special":{"computed":true,"optional":true,"type":"bool"},"upper":{"computed":true,"optional":true,"type":"bool"}}},
+    "random_uuid": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"result":{"computed":true,"type":"string"}}},
+    "random_uuid4": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"result":{"computed":true,"type":"string"}}},
+    "random_uuid7": {"attributes":{"id":{"computed":true,"type":"string"},"keepers":{"optional":true,"type":["map","string"]},"result":{"computed":true,"type":"string"}}}
+  },
+  "data_sources": {}
+}

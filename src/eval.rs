@@ -5,7 +5,9 @@
 //! unbounded process is macro expansion, which is capped.
 
 use crate::builtins;
+use crate::check;
 use crate::reader;
+use crate::schema::{self, SchemaSet};
 use crate::tf;
 use crate::value::*;
 use serde_json::{Map as JMap, Value as J};
@@ -39,6 +41,14 @@ pub struct Graph {
 }
 
 pub struct Interp {
+    pub schemas: Option<Rc<SchemaSet>>,
+    /// Problems found by the schema checks; reported together after evaluation.
+    pub diags: Vec<KilnError>,
+    pub warnings: Vec<KilnError>,
+    /// Providers that have no cached schema; their declarations are not checked.
+    pub unchecked: std::collections::BTreeSet<String>,
+    version_checked: std::collections::HashSet<String>,
+    pos_stack: Vec<Pos>,
     pub global: Env,
     pub providers: BTreeMap<String, ProviderReq>,
     aliases: HashMap<String, String>,
@@ -73,6 +83,17 @@ pub fn get_value(v: &Value, key: &Value) -> Res<Value> {
             _ => Value::Nil,
         },
         Value::Handle(h) => match key {
+            Value::Keyword(k) if h.schema.as_ref().map_or(false, |s| !check::readable(s).contains(&&**k)) => {
+                let names = check::readable(h.schema.as_ref().unwrap());
+                let mut e = KilnError::new(
+                    "K0707",
+                    format!("{} has no attribute `{}`", h.ty, k),
+                );
+                if let Some(s) = check::suggest(k, names) {
+                    e = e.help(format!("did you mean `{}`?", s));
+                }
+                return Err(e);
+            }
             Value::Keyword(k) => Value::Deferred(Rc::new(TfExpr::Attr(
                 Rc::new(TfExpr::Ref(h.address())),
                 k.to_string(),
@@ -166,6 +187,12 @@ impl Interp {
     pub fn new() -> Res<Interp> {
         let vars = builtins::NAMES.iter().map(|n| (Rc::from(*n), Value::Builtin(n))).collect();
         let mut it = Interp {
+            schemas: None,
+            diags: vec![],
+            warnings: vec![],
+            unchecked: Default::default(),
+            version_checked: Default::default(),
+            pos_stack: vec![],
             global: extend(&None, vars),
             providers: BTreeMap::new(),
             aliases: HashMap::new(),
@@ -349,11 +376,17 @@ impl Interp {
                     return Ok(form.clone());
                 }
                 self.depth += 1;
+                if let Some(p) = pos {
+                    self.pos_stack.push(*p);
+                }
                 let r = if self.depth > MAX_DEPTH {
                     fail("K0400", "evaluation nested too deeply; a macro probably expands into itself")
                 } else {
                     self.eval_list(items, env)
                 };
+                if pos.is_some() {
+                    self.pos_stack.pop();
+                }
                 self.depth -= 1;
                 r.map_err(|e| e.at(*pos))
             }
@@ -613,6 +646,10 @@ impl Interp {
             return fail("K0103", "provider configuration must be a map");
         }
         let j = tf::to_json(&cfg)?;
+        if let Some(ps) = self.provider_schema(&name) {
+            let issues = check::check_body(check::Kind::Provider, &ps.provider, &j);
+            self.report(&format!("provider {}", name), issues);
+        }
         self.graph.provider_cfg.entry(name).or_default().push(j);
         Ok(Value::Nil)
     }
@@ -673,7 +710,7 @@ impl Interp {
         if !m.contains_key("source") {
             return fail("K0103", "a module needs a :source");
         }
-        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone() };
+        let h = Handle { kind: HandleKind::Module, ty: "module".into(), name: name.clone(), schema: None };
         if self.graph.modules.insert(name, J::Object(m)).is_some() {
             return fail("K0202", format!("`{}` is declared twice", h.address()));
         }
@@ -1010,7 +1047,13 @@ impl Interp {
                 return fail("K0103", format!("resource arguments must be a map, got a {}", other.type_name()))
             }
         };
-        let h = Handle { kind, ty: ty.to_string(), name: name.clone() };
+        let schema = self.type_schema(kind, ty);
+        let h = Handle { kind, ty: ty.to_string(), name: name.clone(), schema: schema.clone() };
+        if let Some(block) = &schema {
+            let ck = if kind == HandleKind::Data { check::Kind::Data } else { check::Kind::Resource };
+            let issues = check::check_body(ck, block, &body);
+            self.report(&h.address(), issues);
+        }
         let table = match kind {
             HandleKind::Data => &mut self.graph.data,
             _ => &mut self.graph.resources,
@@ -1028,6 +1071,95 @@ impl Interp {
             self.graph.renames.push((h.address(), olds));
         }
         Ok(Value::Handle(Rc::new(h)))
+    }
+
+    // ------------------------------------------------------------ schemas
+
+    fn current_pos(&self) -> Option<Pos> {
+        self.pos_stack.last().copied()
+    }
+
+    fn report(&mut self, what: &str, issues: Vec<check::Issue>) {
+        let pos = self.current_pos();
+        for i in issues {
+            let mut e = KilnError::new(i.code, format!("{}: {}", what, i.msg)).at(pos);
+            e.help = i.help;
+            if i.warning {
+                self.warnings.push(e);
+            } else {
+                self.diags.push(e);
+            }
+        }
+    }
+
+    /// The declared provider a resource type belongs to: the longest
+    /// matching prefix, so `google_beta_x` goes to `google-beta` if declared
+    /// with that prefix.
+    fn provider_of(&self, ty: &str) -> Option<String> {
+        self.providers
+            .iter()
+            .filter(|(_, p)| ty.starts_with(&format!("{}_", p.prefix)))
+            .max_by_key(|(_, p)| p.prefix.len())
+            .map(|(n, _)| n.clone())
+    }
+
+    /// The cached schema for a declared provider, after checking that the
+    /// cached version satisfies the stack's constraint.
+    fn provider_schema(&mut self, name: &str) -> Option<Rc<schema::ProviderSchema>> {
+        let set = self.schemas.clone()?;
+        let req = self.providers.get(name)?;
+        let source = schema::normalize_source(&req.source);
+        let ps = match set.get(&source) {
+            Some(ps) => ps,
+            None => {
+                self.unchecked.insert(source);
+                return None;
+            }
+        };
+        if let Some(c) = req.version.clone() {
+            if self.version_checked.insert(source.clone()) {
+                match schema::satisfies(&ps.version, &c) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let e = KilnError::new(
+                            "K0711",
+                            format!(
+                                "the cached schema for {} is version {}, which does not satisfy \"{}\"",
+                                source, ps.version, c
+                            ),
+                        )
+                        .help("refresh it with `kiln schema <file.kiln>`")
+                        .at(self.current_pos());
+                        self.diags.push(e);
+                    }
+                    Err(msg) => self.diags.push(KilnError::new("K0711", msg).at(self.current_pos())),
+                }
+            }
+            if !schema::satisfies(&ps.version, &c).unwrap_or(false) {
+                return None;
+            }
+        }
+        Some(ps)
+    }
+
+    fn type_schema(&mut self, kind: HandleKind, ty: &str) -> Option<Rc<J>> {
+        let name = self.provider_of(ty)?;
+        let ps = self.provider_schema(&name)?;
+        let table = if kind == HandleKind::Data { &ps.data_sources } else { &ps.resources };
+        if let Some(b) = table.get(ty) {
+            return Some(b.clone());
+        }
+        let what = if kind == HandleKind::Data { "data source" } else { "resource type" };
+        let mut e = KilnError::new(
+            "K0700",
+            format!("{} {} has no {} `{}`", ps.source, ps.version, what, ty),
+        )
+        .at(self.current_pos());
+        if let Some(s) = check::suggest(ty, table.keys().map(|k| k.as_str())) {
+            e = e.help(format!("did you mean `{}`?", s));
+        }
+        self.diags.push(e);
+        None
     }
 
     // ------------------------------------------------------------ expansion

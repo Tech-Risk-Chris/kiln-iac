@@ -1,11 +1,13 @@
 //! Kiln: a Lisp that compiles to Terraform JSON.
 
 pub mod builtins;
+pub mod check;
 pub mod emit;
 pub mod eval;
 pub mod import;
 pub mod ledger;
 pub mod reader;
+pub mod schema;
 pub mod tf;
 pub mod value;
 
@@ -23,6 +25,8 @@ pub struct Build {
     pub lock: String,
     /// Moves introduced by this build.
     pub new_moves: Vec<ledger::Move>,
+    /// Rendered warnings: deprecated arguments, providers without a schema.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Default)]
@@ -33,23 +37,89 @@ pub struct BuildOpts<'a> {
     pub old_output: Option<&'a str>,
     /// Accept disappearing and appearing addresses as real deletions and creations.
     pub accept_replace: bool,
+    /// Provider schemas to check declarations against. None: no checking.
+    pub schemas: Option<std::rc::Rc<schema::SchemaSet>>,
+    /// A provider without a cached schema is an error, not a warning.
+    pub strict: bool,
 }
 
-/// Build one stack: evaluate, reconcile addresses against the ledger, emit.
-/// A pure function of its arguments.
+fn unchecked_provider(source: &str) -> KilnError {
+    KilnError::new("K0712", format!("no cached schema for {}; its declarations are not checked", source))
+        .help("run `kiln schema <file.kiln>` and commit the files it writes under .kiln/schemas/")
+}
+
+/// Build one stack: evaluate, check against provider schemas, reconcile
+/// addresses against the ledger, emit. A pure function of its arguments and
+/// the schema files.
 pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
-    let it = run(src, file, || {
-        let mut it = eval::Interp::new()?;
-        for form in reader::read_all(src)? {
-            it.eval_toplevel(&form)?;
+    let mut it = eval::Interp::new().map_err(|e| e.render(file, src))?;
+    it.schemas = opts.schemas.clone();
+    let mut errors: Vec<String> = vec![];
+    let mut fatal = None;
+    match reader::read_all(src) {
+        Ok(forms) => {
+            for form in forms {
+                if let Err(e) = it.eval_toplevel(&form) {
+                    fatal = Some(e);
+                    break;
+                }
+            }
         }
-        Ok(it)
-    })?;
+        Err(e) => fatal = Some(e),
+    }
+    // Problems found before evaluation stopped are still worth reporting.
+    errors.extend(it.diags.iter().map(|e| e.render(file, src)));
+    if let Some(e) = fatal {
+        errors.push(e.render(file, src));
+    }
+    let mut warnings: Vec<String> = it.warnings.iter().map(|e| e.render_as("warning", file, src)).collect();
+    if let Some(set) = &opts.schemas {
+        for e in set.load_errors() {
+            errors.push(format!("error[K0713]: cannot read a cached schema: {}\n", e));
+        }
+    }
+    for source in &it.unchecked {
+        let e = unchecked_provider(source);
+        if opts.strict {
+            errors.push(e.render(file, src));
+        } else {
+            warnings.push(e.render_as("warning", file, src));
+        }
+    }
+    if !errors.is_empty() {
+        let n = errors.len();
+        let mut msg = warnings.join("\n");
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(&errors.join("\n"));
+        msg.push_str(&format!("\nerror: {} problem{} found; nothing was written\n", n, if n == 1 { "" } else { "s" }));
+        return Err(msg);
+    }
     let old = opts.lock.map(ledger::Ledger::parse).transpose()?;
     let (ledger, new_moves) =
         ledger::reconcile(old.as_ref(), &it.graph, opts.old_output, opts.accept_replace)
             .map_err(|m| format!("{}  --> {}\n", m, file))?;
-    Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves })
+    Ok(Build { json: emit::emit(&it, file, &ledger.moved), lock: ledger.render(), new_moves, warnings })
+}
+
+/// The providers a stack declares in its `ns` form: (name, source, version constraint).
+pub fn providers_of(src: &str, file: &str) -> Result<Vec<(String, String, Option<String>)>, String> {
+    run(src, file, || {
+        let mut it = eval::Interp::new()?;
+        for form in reader::read_all(src)? {
+            if let Value::List(items, _) = &form {
+                if items.first().and_then(|h| h.sym_name()) == Some("ns") {
+                    it.eval_toplevel(&form)?;
+                }
+            }
+        }
+        Ok(it
+            .providers
+            .iter()
+            .map(|(n, p)| (n.clone(), p.source.clone(), p.version.clone()))
+            .collect())
+    })
 }
 
 /// Compile one stack with no ledger to the text of its `main.tf.json`.

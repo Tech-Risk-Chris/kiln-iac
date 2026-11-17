@@ -101,7 +101,7 @@ fn proposals_pair_by_argument_similarity() {
     let e = build(
         &v2_src,
         "t.kiln",
-        &BuildOpts { lock: Some(&v1.lock), old_output: Some(&v1.json), accept_replace: false },
+        &BuildOpts { lock: Some(&v1.lock), old_output: Some(&v1.json), ..BuildOpts::default() },
     )
     .err()
     .unwrap();
@@ -113,7 +113,7 @@ fn proposals_pair_by_argument_similarity() {
 fn replace_accepts_delete_and_create() {
     let v1 = ok("(r/pet \"a\" {})", None);
     let src = format!("{}(r/pet \"b\" {{}})", NS);
-    let v2 = build(&src, "t.kiln", &BuildOpts { lock: Some(&v1.lock), old_output: None, accept_replace: true }).unwrap();
+    let v2 = build(&src, "t.kiln", &BuildOpts { lock: Some(&v1.lock), accept_replace: true, ..BuildOpts::default() }).unwrap();
     assert!(moved(&v2).is_empty());
     assert!(v2.lock.contains("random_pet.b") && !v2.lock.contains("random_pet.a"));
 }

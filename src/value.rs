@@ -34,7 +34,11 @@ impl KilnError {
     }
     /// Render in the rustc style, with the offending source line.
     pub fn render(&self, file: &str, src: &str) -> String {
-        let mut s = format!("error[{}]: {}\n", self.code, self.msg);
+        self.render_as("error", file, src)
+    }
+
+    pub fn render_as(&self, label: &str, file: &str, src: &str) -> String {
+        let mut s = format!("{}[{}]: {}\n", label, self.code, self.msg);
         if let Some(p) = self.pos {
             s.push_str(&format!("  --> {}:{}:{}\n", file, p.line, p.col));
             if let Some(line) = src.lines().nth(p.line as usize - 1) {
@@ -108,6 +112,8 @@ pub struct Handle {
     pub kind: HandleKind,
     pub ty: String,
     pub name: String,
+    /// The schema block of the type, when the provider's schema is known.
+    pub schema: Option<Rc<serde_json::Value>>,
 }
 
 impl Handle {

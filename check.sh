@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Engine-side checks. Needs cargo and OpenTofu (or Terraform: TOFU=terraform ./check.sh).
 #
-#   ./check.sh           build, test, and `init` + `validate` every example
+#   ./check.sh           build, test, fetch missing provider schemas, check every
+#                        example against them, and `init` + `validate` it
+#   SCHEMA=1 ./check.sh  refresh every provider schema, not only missing ones
 #   PLAN=1 ./check.sh    additionally plan the generated and the hand-written
 #                        configuration and compare the two plans (needs credentials)
 #
@@ -40,6 +42,8 @@ export TF_IN_AUTOMATION=1
   run "cargo build --release" cargo build --release
   run "cargo test" cargo test
   KILN=./target/release/kiln
+  schema_mode="--if-missing"
+  [ "${SCHEMA:-0}" = "1" ] && schema_mode=""
 
   plan() { # <dir> <label>: plan a configuration and save the plan as JSON
     run "$1: plan" "$TOFU" -chdir="$1" plan -input=false -no-color -lock=false -out=plan.bin
@@ -51,7 +55,8 @@ export TF_IN_AUTOMATION=1
     ex="$(dirname "$src")"
     name="$(basename "$ex")"
     step "$ex"
-    run "committed output and lock are current" "$KILN" build "$src" --check
+    run "provider schemas are cached" "$KILN" schema "$src" $schema_mode
+    run "committed output and lock are current, schema-checked" "$KILN" build "$src" --check --strict
     for d in "$ex/out" "$ex/original"; do
       [ -d "$d" ] || continue
       run "$d: init" "$TOFU" -chdir="$d" init -backend=false -input=false -no-color
@@ -80,6 +85,8 @@ export TF_IN_AUTOMATION=1
     rm -rf "$imp"
     run "kiln import" "$KILN" import "$orig" -o "$imp"
     [ -d "$imp/out" ] || continue
+    run "provider schemas are cached" "$KILN" schema "$imp/main.kiln" $schema_mode
+    run "imported stack is schema-checked" "$KILN" build "$imp/main.kiln" --strict
     run "$orig: init" "$TOFU" -chdir="$orig" init -backend=false -input=false -no-color
     run "imported: init" "$TOFU" -chdir="$imp/out" init -backend=false -input=false -no-color
     run "imported: validate" "$TOFU" -chdir="$imp/out" validate -no-color
@@ -90,6 +97,12 @@ export TF_IN_AUTOMATION=1
         "$OUT/plan-$name-imported.json" "$OUT/plan-$name-original.json"
     fi
   done
+
+  if [ -n "$(git status --porcelain .kiln/schemas 2>/dev/null)" ]; then
+    echo
+    echo "NOTE  new or changed provider schemas under .kiln/schemas/; commit them:"
+    git status --short .kiln/schemas | sed 's/^/      /'
+  fi
 
   echo
   echo "RESULT: $fails failure(s)"

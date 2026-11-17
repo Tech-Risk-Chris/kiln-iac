@@ -6,37 +6,70 @@ you write. The generated `main.tf.json` has no dependency on Kiln.
 
 Design document: *Kiln: a typed Lisp that compiles to Terraform*.
 
-## Status: M1
+## Status: M2
 
-M0 (reader, evaluator, macros, untyped emitter) and M1 (address ledger, `moved`
-blocks, `kiln import`) are done.
+M0 (reader, evaluator, macros, emitter), M1 (address ledger, `moved` blocks,
+`kiln import`) and M2 (checking against provider schemas) are done.
 
 | Done | Not yet |
 | --- | --- |
-| Resources, data sources, modules, providers, outputs, backend | Types from provider schemas (M2) |
+| Resources, data sources, modules, providers, outputs, backend | Static types inferred from the source (M3) |
 | Functions, `let`, `for`, destructuring, components | Static `Deferred` / `Secret` checking (M3); staging is checked dynamically |
 | Macros with quasiquote and auto-gensym | Hygiene beyond gensym (M5) |
 | Deferred values that lift through `str`, arithmetic, comparison, `if`, `get` | Stacks, contexts, cross-stack references (M4) |
 | Deterministic output, `--check` | Pruning `moved` blocks once every state has applied them (M4) |
-| `kiln.lock`: renames become `moved` blocks; undeclared renames stop the build | |
+| `kiln.lock`: renames become `moved` blocks; undeclared renames stop the build | Typing module inputs and outputs |
 | `kiln import`: HCL to Kiln with addresses preserved | |
+| Declarations checked against cached provider schemas | |
 
 ## Use
 
 ```sh
 cargo build --release
+kiln schema examples/gke/main.kiln           # cache provider schemas (runs tofu)
 kiln build examples/gke/main.kiln            # writes out/main.tf.json and kiln.lock
-kiln build examples/gke/main.kiln --check    # CI: fail if either is stale
+kiln build examples/gke/main.kiln --check --strict   # CI
 kiln expand examples/gke/main.kiln           # program with macros expanded
 kiln import path/to/terraform -o path/to/stack
 kiln mv stack/main.kiln google_x.old google_x.new
 
-./check.sh               # tests, tofu init/validate, import round trip
+./check.sh               # tests, schemas, tofu init/validate, import round trip
 PLAN=1 ./check.sh        # also: generated and imported plans equal the HCL plans
 tools/move-test.sh       # applies `random` resources locally to prove state moves
 ```
 
-Commit `main.kiln`, `kiln.lock` and `out/main.tf.json` together.
+Commit `main.kiln`, `kiln.lock`, `out/main.tf.json` and `.kiln/schemas/` together.
+
+## Checking against provider schemas
+
+Every resource, data source and provider block is checked against its
+provider's schema before anything is written:
+
+| Code | Problem |
+| --- | --- |
+| K0700 | unknown resource type or data source, with a spelling suggestion |
+| K0701 | unknown argument, at any depth, with a spelling suggestion |
+| K0702 | missing required argument or block |
+| K0703 | setting an attribute the provider computes |
+| K0704 | wrong value type: `"1460"` for a number, a string for a set |
+| K0705 | a nested block given as something other than a map |
+| K0706 | too many or too few nested blocks |
+| K0707 | reading an attribute a resource does not have, e.g. `(:self_lnk vpc)` |
+| K0711 | the cached schema's version does not satisfy the stack's constraint |
+| K0712 | no cached schema for a provider (a warning; an error with `--strict`) |
+| K0750 | a deprecated argument (a warning) |
+
+All problems are reported together, each at the declaration that caused it.
+A value that is a Terraform expression passes: its type is known only to the
+engine. That gap, and errors in code paths that did not run, close with M3.
+
+Schemas live in `.kiln/schemas/<namespace>/<provider>.json`: one provider at
+one version, descriptions stripped, one line per resource type. The nearest
+`.kiln` directory at or above a stack applies. `kiln schema <file.kiln>` fetches
+them with the engine (`$TOFU`, default `tofu`) for the providers in the stack's
+`ns`; `kiln schema --from schema.json --lock .terraform.lock.hcl` converts output
+you already have. The cache is committed, so builds need neither the engine
+nor the network. One version per provider per repository, for now.
 
 ## Renaming without destroying
 
@@ -118,8 +151,11 @@ src/tf.rs         Terraform expression rendering, value -> Terraform JSON
 src/emit.rs       main.tf.json
 src/ledger.rs     kiln.lock: address diffing, moved blocks, rename guard
 src/import.rs     HCL -> Kiln
+src/schema.rs     schema cache, conversion, version constraints
+src/check.rs      checking declarations against schemas
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
 examples/import-offline/  HCL fixture for the importer, credential-free providers
 tests/fixtures/move/      three versions of one stack for tools/move-test.sh
+.kiln/schemas/            cached provider schemas (Google 6.50.0)
 ```
