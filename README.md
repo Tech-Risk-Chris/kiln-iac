@@ -10,8 +10,8 @@ Design: [DESIGN.md](DESIGN.md). Milestones and status: [ROADMAP.md](ROADMAP.md).
 
 M0 (reader, evaluator, macros, emitter), M1 (address ledger, `moved` blocks,
 `kiln import`) and M2 (checking against provider schemas) are done. Of M3, secrecy
-tracking, structural recursion and (silent) type inference are done; see
-[ROADMAP.md](ROADMAP.md).
+tracking, structural recursion, type inference and the static stage analysis are
+done; see [ROADMAP.md](ROADMAP.md).
 
 | Done | Not yet |
 | --- | --- |
@@ -32,7 +32,7 @@ kiln schema examples/gke/main.kiln           # cache provider schemas (runs tofu
 kiln build examples/gke/main.kiln            # writes out/main.tf.json and kiln.lock
 kiln build examples/gke/main.kiln --check --strict   # CI
 kiln expand examples/gke/main.kiln           # program with macros expanded
-kiln types examples/gke/main.kiln            # inferred types (errors not enforced yet)
+kiln types examples/gke/main.kiln            # inferred types and stage errors
 kiln import path/to/terraform -o path/to/stack
 kiln mv stack/main.kiln google_x.old google_x.new
 
@@ -140,7 +140,9 @@ it. Addresses are unchanged, so the first plan against existing state is a no-op
   values and compile to Terraform expressions. `(tf/name args...)` calls any Terraform
   function; `(tf/expr "...")` embeds a raw expression.
 - **A deferred value cannot shape the graph.** Branching on one to declare a resource,
-  iterating over one, or naming a resource with one is a compile error (K0312 to K0314).
+  iterating over one, or naming a resource with one is a compile error (K0312 to K0316).
+  The type checker finds this in every function and branch, including code that no
+  build runs, and names the attribute the value came from.
 - **No forward references; only structural recursion.** A definition sees only what
   precedes it, and a function may call itself only on a strictly smaller part of one
   of its parameters: `(rest xs)`, a destructured part, `(:children node)`, an element.
