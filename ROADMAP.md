@@ -6,8 +6,8 @@ Milestones are ordered so that the adoption-critical parts (output shape, addres
 | --- | --- | --- |
 | M0 Core | Done | Met: the hand-written GKE example plans identically to its HCL original |
 | M1 Address safety | Done | Met on the repository's fixtures; a real client repository is still to try |
-| M2 Schema checking | Done; engine check pending | Met in tests: every mistake in a seeded corpus of 20 is caught before Terraform runs |
-| M3 Types, staging, secrecy | Next | |
+| M2 Schema checking | Done | Met: every mistake in a seeded corpus of 20 is caught before Terraform runs |
+| M3 Types, staging, secrecy | In progress | |
 | M4 Stacks and contexts | | |
 | M5 Hardening | | |
 
@@ -29,7 +29,7 @@ Every resource, data source and provider block is checked against cached provide
 
 This replaced the original M2 ("types"). Checking the evaluated graph gives users schema errors early. Full inference, which also catches errors in code paths that did not run, moved to M3, where staging needs it anyway.
 
-**Gate:** every argument error in a seeded test corpus is caught before Terraform runs. Met in `tests/m2.rs`. Waiting on a `check.sh` run against the engine, which also fetches the `random` and `local` schemas.
+**Gate:** every argument error in a seeded test corpus is caught before Terraform runs. Met in `tests/m2.rs`. Against OpenTofu 1.13.9, `kiln schema` fetched the real `random` and `local` schemas, and the imported fixtures pass a strict check against all three cached providers.
 
 ## M3 Types, staging, secrecy
 
