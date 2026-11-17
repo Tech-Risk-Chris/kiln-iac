@@ -16,6 +16,7 @@ USAGE:
     kiln mv <file.kiln> <from-address> <to-address>
     kiln expand <file.kiln>
     kiln types <file.kiln>
+    kiln explain <code>
     kiln --version
 
     build     Compile a stack to <dir>/main.tf.json (default: out/ beside the source)
@@ -31,6 +32,7 @@ USAGE:
               it. Addresses are preserved.
     mv        Declare that a resource was renamed; the next build emits a `moved` block.
     expand    Print the program with all macros expanded.
+    explain   Explain a diagnostic code, e.g. `kiln explain K0312`.
     types     Print the inferred type of every top-level definition, stage errors,
               and the shape errors the checker would report (not enforced yet).
 ";
@@ -312,6 +314,12 @@ fn real_main(args: Vec<String>) -> Result<(), String> {
         ("expand", 1) => {
             let file = p(0).unwrap();
             print!("{}", kiln::expand(&read(&file)?, &shown(&file))?);
+            Ok(())
+        }
+        ("explain", 1) => {
+            let c = kiln::codes::find(&a.positional[0])
+                .ok_or_else(|| format!("no diagnostic code `{}`; see ERRORS.md", a.positional[0]))?;
+            println!("{}: {}\n\n{}", c.code, c.title, c.explain);
             Ok(())
         }
         ("types", 1) => {

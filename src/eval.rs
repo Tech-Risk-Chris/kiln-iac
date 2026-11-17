@@ -1364,7 +1364,14 @@ impl Interp {
     pub fn peek_schema(&self, data: bool, ty: &str) -> Option<Rc<J>> {
         let set = self.schemas.as_ref()?;
         let name = self.provider_of(ty)?;
-        let ps = set.get(&self.providers.get(&name)?.source)?;
+        let req = self.providers.get(&name)?;
+        let ps = set.get(&req.source)?;
+        // a schema of the wrong version is not used to check anything
+        if let Some(c) = &req.version {
+            if !schema::satisfies(&ps.version, c).unwrap_or(false) {
+                return None;
+            }
+        }
         let table = if data { &ps.data_sources } else { &ps.resources };
         table.get(ty).cloned()
     }

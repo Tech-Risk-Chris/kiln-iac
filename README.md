@@ -1,38 +1,31 @@
 # Kiln
 
 A Lisp that compiles to Terraform JSON. Terraform or OpenTofu stays the engine
-(providers, plan, apply, state); Kiln replaces HCL and Terragrunt as the thing
-you write. The generated `main.tf.json` has no dependency on Kiln.
+(providers, plan, apply, state); Kiln replaces HCL and Terragrunt as the thing you
+write. The generated `main.tf.json` has no dependency on Kiln: stop using Kiln on any
+day and keep the files.
 
-Design: [DESIGN.md](DESIGN.md). Milestones and status: [ROADMAP.md](ROADMAP.md).
+- [DESIGN.md](DESIGN.md): the language Kiln is heading for, and why.
+- [ROADMAP.md](ROADMAP.md): milestones, their gates, and where things stand.
+- [ERRORS.md](ERRORS.md): every diagnostic code; `kiln explain K0312` prints one.
 
-## Status: M2, M3 under way
+## Status
 
-M0 (reader, evaluator, macros, emitter), M1 (address ledger, `moved` blocks,
-`kiln import`) and M2 (checking against provider schemas) are done. Of M3, secrecy
-tracking, structural recursion, type inference and the static stage analysis are
-done; see [ROADMAP.md](ROADMAP.md).
-
-| Done | Not yet |
-| --- | --- |
-| Resources, data sources, modules, providers, outputs, backend | Static types inferred from the source (M3) |
-| Functions, `let`, `for`, destructuring, components | Static `Deferred` / `Secret` checking (M3); staging is checked dynamically |
-| Macros with quasiquote and auto-gensym | Hygiene beyond gensym (M5) |
-| Deferred values that lift through `str`, arithmetic, comparison, `if`, `get` | Stacks, contexts, cross-stack references (M4) |
-| Deterministic output, `--check` | Pruning `moved` blocks once every state has applied them (M4) |
-| `kiln.lock`: renames become `moved` blocks; undeclared renames stop the build | Typing module inputs and outputs |
-| `kiln import`: HCL to Kiln with addresses preserved | |
-| Declarations checked against cached provider schemas | |
+M0 to M2 are done: the language and its evaluator, address safety (`kiln.lock`,
+`moved` blocks, `kiln import`), and checking against provider schemas. M3 (types,
+staging, secrecy) has met its gate and has one step left, typed modules. Stacks and
+contexts, the replacement for Terragrunt, are M4. Details in [ROADMAP.md](ROADMAP.md).
 
 ## Use
 
 ```sh
 cargo build --release
-kiln schema examples/gke/main.kiln           # cache provider schemas (runs tofu)
-kiln build examples/gke/main.kiln            # writes out/main.tf.json and kiln.lock
-kiln build examples/gke/main.kiln --check --strict   # CI
-kiln expand examples/gke/main.kiln           # program with macros expanded
-kiln types examples/gke/main.kiln            # inferred types and stage errors
+kiln schema examples/gke/main.kiln        # cache the providers' schemas (runs tofu)
+kiln build  examples/gke/main.kiln        # writes out/main.tf.json and kiln.lock
+kiln build  examples/gke/main.kiln --check --strict    # in CI
+kiln types  examples/gke/main.kiln        # inferred types and type errors
+kiln expand examples/gke/main.kiln        # the program with macros expanded
+kiln explain K0312                        # what a diagnostic means
 kiln import path/to/terraform -o path/to/stack
 kiln mv stack/main.kiln google_x.old google_x.new
 
@@ -42,77 +35,6 @@ tools/move-test.sh       # applies `random` resources locally to prove state mov
 ```
 
 Commit `main.kiln`, `kiln.lock`, `out/main.tf.json` and `.kiln/schemas/` together.
-
-## Checking against provider schemas
-
-Every resource, data source and provider block is checked against its
-provider's schema before anything is written:
-
-| Code | Problem |
-| --- | --- |
-| K0700 | unknown resource type or data source, with a spelling suggestion |
-| K0701 | unknown argument, at any depth, with a spelling suggestion |
-| K0702 | missing required argument or block |
-| K0703 | setting an attribute the provider computes |
-| K0704 | wrong value type: `"1460"` for a number, a string for a set |
-| K0705 | a nested block given as something other than a map |
-| K0706 | too many or too few nested blocks |
-| K0707 | reading an attribute that does not exist, e.g. `(:self_lnk vpc)`, also inside nested blocks |
-| K0708 | reading an attribute from a list or set of blocks without picking one |
-| K0711 | the cached schema's version does not satisfy the stack's constraint |
-| K0712 | no cached schema for a provider (a warning; an error with `--strict`) |
-| K0750 | a deprecated argument (a warning) |
-| K0320 | a secret flowing into an argument that is not sensitive, or into `count` / `for_each` |
-| K0321 | an output that exposes a secret without `:sensitive true` |
-| K0322 | `(secret x)` on a value written in the source |
-| K0317 | `:count` or `:for_each` set inside `count-deferred` / `for-each-deferred` |
-| K0318 | `for-each-deferred` nested in either form, or `count-deferred` inside `for-each-deferred` |
-
-All problems are reported together, each at the declaration that caused it.
-A value that is a Terraform expression passes: its type is known only to the
-engine. That gap, and errors in code paths that did not run, close with M3.
-
-Schemas live in `.kiln/schemas/<namespace>/<provider>.json`: one provider at
-one version, descriptions stripped, one line per resource type. The nearest
-`.kiln` directory at or above a stack applies. `kiln schema <file.kiln>` fetches
-them with the engine (`$TOFU`, default `tofu`) for the providers in the stack's
-`ns`; `kiln schema --from schema.json --lock .terraform.lock.hcl` converts output
-you already have. The cache is committed, so builds need neither the engine
-nor the network. One version per provider per repository, for now.
-
-## Renaming without destroying
-
-Kiln flattens components into resources, so a refactoring can change an address,
-and Terraform reads a changed address as destroy-and-create. `kiln.lock` records
-every address a stack has emitted, and each build diffs against it.
-
-```clojure
-(cluster ^{:was "primary"} "main" ctx {...})        ; a component instance
-(g/compute_network ^{:was "vpc"} "network" {...})   ; a single resource
-```
-
-- A name annotated with `:was` yields a `moved` block for every address under it.
-  The annotation can be deleted once built; the ledger keeps the move.
-- `kiln mv <file> <from> <to>` declares the same thing without touching the source.
-- If an address disappears while another of the same type appears and nothing
-  declares the rename, the build stops (K0500) and proposes pairings ranked by how
-  alike the arguments are. `--replace` says they really are a deletion and a creation.
-- Plain additions and deletions pass through; the plan shows them as usual.
-
-## Importing HCL
-
-`kiln import <dir> -o <dir>` reads every `.tf` file, writes `main.kiln`, and builds
-it. Addresses are unchanged, so the first plan against existing state is a no-op.
-
-- Declarations are reordered: HCL is unordered, Kiln has no forward references.
-- Locals, and variables with a default, become compile-time definitions.
-- Expressions with a Kiln counterpart are translated (`"${a}-x"` to `(str a "-x")`,
-  references to `(:attr resource)`, operators, conditionals, function calls).
-  The rest (`for` expressions, splats, `each.value`, `path.module`) are carried
-  over as `(tf/expr "...")`, with compile-time values spliced in.
-- Outside the subset, and reported rather than guessed at: `dynamic` blocks,
-  variables without a default, provisioners, `moved` / `import` / `check` blocks,
-  template directives. Comments are not carried over.
 
 ## The language in one screen
 
@@ -137,51 +59,124 @@ it. Addresses are unchanged, so the first plan against existing state is a no-op
 - **Names are the provider's.** `:remove_default_node_pool`, `g/container_cluster`.
 - **Addresses** are the component instance names plus the logical name, joined by `__`.
 - **Nil is omission.** A `nil` argument is left out, so `(when cond value)` works inside a map.
-- **Reading an attribute of a resource** gives a deferred value: a Terraform expression.
-  `str`, `+ - * /`, comparisons, `not`, `get` and value-position `if` accept deferred
-  values and compile to Terraform expressions. `(tf/name args...)` calls any Terraform
-  function; `(tf/expr "...")` embeds a raw expression.
-- **A deferred value cannot shape the graph.** Branching on one to declare a resource,
-  iterating over one, or naming a resource with one is a compile error (K0312 to K0316).
-  The type checker finds this in every function and branch, including code that no
-  build runs, and names the attribute the value came from.
+- **Reading an attribute of a resource gives a value known only after apply**: a
+  Terraform expression. `str`, arithmetic, comparisons, `not`, `get` and value-position
+  `if` accept such values and compile to Terraform expressions. `(tf/name args...)`
+  calls any Terraform function; `(tf/expr "...")` embeds a raw expression.
+- **Such a value cannot shape the graph.** Branching on one to declare a resource,
+  iterating over one, or naming a resource with one is a compile error, found in every
+  function and branch, including code that no build runs.
 - **When only the engine knows.** `(count-deferred cond body...)` and
   `(for-each-deferred [x coll] body...)` give every declaration in the body a real
   `count` or `for_each`, with `x` as `each.value`. References to those resources come
   out as `one(x[*].a)`, `x[each.key].a` inside the block, or a keyed map outside.
   See `examples/deferred`.
+- **Secrets stay secret.** Reading a sensitive attribute marks the value secret,
+  through any computation. It may flow only into sensitive arguments and sensitive
+  outputs. `(tf/nonsensitive x)` declassifies on purpose; `(secret x)` marks a value.
 - **No forward references; only structural recursion.** A definition sees only what
   precedes it, and a function may call itself only on a strictly smaller part of one
   of its parameters: `(rest xs)`, a destructured part, `(:children node)`, an element.
   Every build terminates. Counting down (`(f (- n 1))`) is not structural; use `range`.
-- **Secrets stay secret.** Reading a sensitive attribute marks the value secret, through
-  any computation. It may flow only into sensitive arguments and sensitive outputs.
-  `(tf/nonsensitive x)` declassifies on purpose.
 - **Keyword and string keys are interchangeable for lookup**: `(:a m)` finds `"a"`.
-- **Special forms:** `def defn defmacro ns` (top level only), `fn let if do for and or quote`,
-  `data provider output backend module scope`. `when`, `when-not`, `cond` and
-  `defcomponent` are macros in `src/prelude.kiln`.
+- **Special forms:** `def defn defmacro ns` (top level only), `fn let if do for and or
+  quote`, `data provider output backend module scope count-deferred for-each-deferred`.
+  `when`, `when-not`, `cond` and `defcomponent` are macros in `src/prelude.kiln`.
+
+## What the compiler checks
+
+Before anything is written, and with every problem reported together at the place
+that caused it:
+
+- **Provider schemas.** Every resource, data source and provider block against its
+  provider's schema: resource types, argument names at any depth (with spelling
+  suggestions), required and read-only arguments, value types, nested blocks and how
+  many of them. Also attribute reads, down into nested blocks.
+- **Stages.** No value known only after apply decides whether a resource exists, what
+  is iterated, or what anything is called.
+- **Secrets.** No sensitive value reaches an argument, output, `count` or `for_each`
+  that is not sensitive.
+- **Recursion.** Every recursive function shrinks a parameter, so every build stops.
+- **Addresses.** No resource is silently renamed into a destroy and create.
+
+Each of these runs twice. Evaluation checks what a build actually produces.
+Type inference, which runs on every top-level form before it is evaluated, checks
+every function and branch, so a mistake in a helper nobody calls yet, or in the
+`prod` branch while you build `dev`, is found as well. Inference is gradual: where it
+cannot be precise it gives up quietly rather than complain about valid code. Shape
+mismatches it finds are shown by `kiln types` but not enforced yet.
+
+Every code is listed in [ERRORS.md](ERRORS.md), which is generated from
+`src/codes.rs`; `kiln explain <code>` prints an entry.
+
+## Provider schemas
+
+Schemas live in `.kiln/schemas/<namespace>/<provider>.json`: one provider at one
+version, descriptions stripped, one line per resource type. The nearest `.kiln`
+directory at or above a stack applies. `kiln schema <file.kiln>` fetches them with the
+engine (`$TOFU`, default `tofu`) for the providers in the stack's `ns`;
+`kiln schema --from schema.json --lock .terraform.lock.hcl` converts output you
+already have. The cache is committed, so builds need neither the engine nor the
+network. A provider without a cached schema is a warning, or an error with
+`--strict`. A cached schema whose version does not satisfy the stack's constraint is
+not used. One version per provider per repository, for now.
+
+## Renaming without destroying
+
+Kiln flattens components into resources, so a refactoring can change an address, and
+Terraform reads a changed address as destroy and create. `kiln.lock` records every
+address a stack has emitted, and each build diffs against it.
+
+```clojure
+(cluster ^{:was "primary"} "main" ctx {...})        ; a component instance
+(g/compute_network ^{:was "vpc"} "network" {...})   ; a single resource
+```
+
+- A name annotated with `:was` yields a `moved` block for every address under it.
+  The annotation can be deleted once built; the ledger keeps the move.
+- `kiln mv <file> <from> <to>` declares the same thing without touching the source.
+- If an address disappears while another of the same type appears and nothing
+  declares the rename, the build stops and proposes pairings ranked by how alike the
+  arguments are. `--replace` says they really are a deletion and a creation.
+- Plain additions and deletions pass through; the plan shows them as usual.
+
+## Importing HCL
+
+`kiln import <dir> -o <dir>` reads every `.tf` file, writes `main.kiln`, and builds it.
+Addresses are unchanged, so the first plan against existing state is a no-op.
+
+- Declarations are reordered: HCL is unordered, Kiln has no forward references.
+- Locals, and variables with a default, become compile-time definitions.
+- Expressions with a Kiln counterpart are translated (`"${a}-x"` to `(str a "-x")`,
+  references to `(:attr resource)`, operators, conditionals, function calls). The
+  rest (`for` expressions, splats, `each.value`, `path.module`) are carried over as
+  `(tf/expr "...")`, with compile-time values spliced in.
+- Outside the subset, and reported rather than guessed at: `dynamic` blocks,
+  variables without a default, provisioners, `moved` / `import` / `check` blocks,
+  template directives. Comments are not carried over.
 
 ## Layout
 
 ```
 src/reader.rs     text -> values (code is data)
-src/eval.rs       evaluator, macro expander, declarations
+src/eval.rs       evaluator, macro expander, declarations, count/for_each forms
 src/builtins.rs   built-in functions and lifting over deferred values
 src/tf.rs         Terraform expression rendering, value -> Terraform JSON
 src/emit.rs       main.tf.json
 src/ledger.rs     kiln.lock: address diffing, moved blocks, rename guard
 src/import.rs     HCL -> Kiln
 src/schema.rs     schema cache, conversion, version constraints
-src/check.rs      checking declarations against schemas, secret flows
+src/check.rs      checking evaluated declarations against schemas, secret flows
+src/infer.rs      type inference: gradual shapes; stage, effect and secrecy graph
 src/recursion.rs  the structural recursion check
-src/infer.rs      gradual type inference
+src/codes.rs      every diagnostic code, the source of ERRORS.md
 src/prelude.kiln  library macros
 examples/gke/             source, lock, committed output, hand-written HCL original
 examples/deferred/        count-deferred and for-each-deferred
 examples/import-offline/  HCL fixture for the importer, credential-free providers
 tests/fixtures/move/      three versions of one stack for tools/move-test.sh
-.kiln/schemas/            cached provider schemas (Google 6.50.0)
+.kiln/schemas/            cached provider schemas
+docs/M3.md                the M3 plan and its status
 ```
 
 ## License

@@ -62,12 +62,13 @@ pub enum Ty {
 #[derive(Clone)]
 enum Node {
     Var,
-    /// A value known only after apply.
-    Src { desc: String, pos: Option<Pos> },
+    /// A value known only after apply; `secret` if it is also sensitive.
+    Src { desc: String, pos: Option<Pos>, secret: bool },
     /// Declaring a resource.
     Decl,
-    /// Something that must be known at compile time.
-    Sink { code: &'static str, msg: String, help: &'static str, pos: Option<Pos> },
+    /// Something that must be known at compile time, or (`secret`) must not
+    /// receive a sensitive value.
+    Sink { code: &'static str, msg: String, help: &'static str, pos: Option<Pos>, secret: bool },
 }
 
 #[derive(Default)]
@@ -136,7 +137,7 @@ pub struct Clash {
 pub struct StageError {
     pub code: &'static str,
     pub msg: String,
-    pub help: &'static str,
+    pub help: String,
     pub pos: Option<Pos>,
 }
 
@@ -161,6 +162,8 @@ pub struct Infer {
     /// Enclosing count-deferred (1) and for-each-deferred (2) forms.
     inst_frames: Vec<u8>,
     reported: HashSet<u32>,
+    /// Type mismatches that count only if the value is known at compile time.
+    typed: Vec<(u32, StageError)>,
     /// Sources already blamed: one error per cause, so that iterating a
     /// deferred list does not also report each name derived from it.
     blamed: HashSet<u32>,
@@ -180,6 +183,10 @@ const COLLECTION_ARG: &[&str] = &[
 ];
 const COLLECTION_ARGS: &[&str] = &["concat", "merge", "merge-deep", "zipmap", "flatten"];
 const TEXT_ARG: &[&str] = &["name", "keyword", "slug", "lower", "upper"];
+
+const RESOURCE_META: &[&str] =
+    &["count", "for_each", "depends_on", "provider", "lifecycle", "provisioner", "connection", "dynamic"];
+const DATA_META: &[&str] = &["count", "for_each", "depends_on", "provider", "lifecycle", "dynamic"];
 
 const K0312: (&str, &str, &str) = (
     "K0312",
@@ -236,6 +243,7 @@ impl Infer {
             scope_depth: 0,
             inst_frames: vec![],
             reported: HashSet::new(),
+            typed: vec![],
             blamed: HashSet::new(),
             clashes: vec![],
             errors: vec![],
@@ -251,7 +259,48 @@ impl Infer {
 
     fn src(&mut self, desc: String) -> u32 {
         let pos = self.pos.last().copied();
-        self.g.add(Node::Src { desc, pos })
+        self.g.add(Node::Src { desc, pos, secret: false })
+    }
+
+    fn secret_src(&mut self, desc: String) -> u32 {
+        let pos = self.pos.last().copied();
+        self.g.add(Node::Src { desc, pos, secret: true })
+    }
+
+    /// Every stage node in a type, all the way down.
+    fn all_anns(&self, t: &Ty, out: &mut Vec<u32>) {
+        match self.resolve(t) {
+            Ty::Dyn(a) | Ty::P(_, a) => out.push(a),
+            Ty::Vec(e, a) | Ty::Map(e, a) => {
+                out.push(a);
+                self.all_anns(&e, out);
+            }
+            Ty::Rec(f, _, a) => {
+                out.push(a);
+                for (t, _) in f.values() {
+                    self.all_anns(t, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// No sensitive value may flow into this type.
+    fn secret_sink(&mut self, t: &Ty, code: &'static str, msg: String, help: &'static str) {
+        let mut anns = vec![];
+        self.all_anns(t, &mut anns);
+        if anns.is_empty() && matches!(self.resolve(t), Ty::Var(_)) {
+            // an unconstrained parameter: give it a stage node so callers' secrets reach here
+            anns.push(self.stage(t));
+        }
+        if anns.is_empty() {
+            return;
+        }
+        let pos = self.pos.last().copied();
+        let s = self.g.add(Node::Sink { code, msg, help, pos, secret: true });
+        for a in anns {
+            self.g.edge(a, s);
+        }
     }
 
     fn link(&mut self, a: u32, b: u32) {
@@ -305,7 +354,7 @@ impl Infer {
     fn sink(&mut self, t: &Ty, k: (&'static str, &'static str, &'static str)) {
         let a = self.stage(t);
         let pos = self.pos.last().copied();
-        let s = self.g.add(Node::Sink { code: k.0, msg: k.1.to_string(), help: k.2, pos });
+        let s = self.g.add(Node::Sink { code: k.0, msg: k.1.to_string(), help: k.2, pos, secret: false });
         self.g.edge(a, s);
     }
 
@@ -374,8 +423,15 @@ impl Infer {
             (Ty::Nil, _) | (_, Ty::Nil) => Ok(()),
             (Ty::Var(x), Ty::Var(y)) if x == y => Ok(()),
             (Ty::Dyn(x), t) | (t, Ty::Dyn(x)) => {
-                if let Some(y) = self.top(t) {
-                    l(self, *x, y);
+                match t {
+                    // an unconstrained variable becomes `?` too, so that stage and
+                    // secrecy flow on through it
+                    Ty::Var(v) if link => self.s.tys[*v as usize] = Some(Ty::Dyn(*x)),
+                    _ => {
+                        if let Some(y) = self.top(t) {
+                            l(self, *x, y);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -592,7 +648,7 @@ impl Infer {
 
     fn shape_of_type(t: &J, a: u32) -> Ty {
         match t {
-            J::String(s) => match s.as_str() {
+            J::String(x) => match x.as_str() {
                 "string" => Ty::P(Prim::Str, a),
                 "number" => Ty::P(Prim::Num, a),
                 "bool" => Ty::P(Prim::Bool, a),
@@ -612,25 +668,28 @@ impl Infer {
         }
     }
 
-    fn shape_of_block(b: &J, a: u32) -> Ty {
+    fn shape_of_block(&mut self, b: &J, a: u32, path: &str) -> Ty {
         let mut f = Fields::new();
         if let Some(attrs) = b["attributes"].as_object() {
             for (k, x) in attrs {
-                f.insert(k.clone(), (Self::shape_of_attr(x, a), false));
+                let t = self.shape_of_attr(x, a, &format!("{}.{}", path, k));
+                f.insert(k.clone(), (t, false));
             }
         }
         if let Some(bts) = b["block_types"].as_object() {
             for (k, bt) in bts {
-                f.insert(k.clone(), (Self::shape_of_block_type(bt, a), false));
+                let t = self.shape_of_block_type(bt, a, &format!("{}.{}", path, k));
+                f.insert(k.clone(), (t, false));
             }
         }
         Ty::Rec(f, Tail::Closed, a)
     }
 
-    fn shape_of_attr(x: &J, a: u32) -> Ty {
+    fn shape_of_attr(&mut self, x: &J, a: u32, path: &str) -> Ty {
+        let a = if x["sensitive"] == J::Bool(true) { self.secret_src(format!("`{}`", path)) } else { a };
         match x.get("nested_type") {
             Some(nt) => {
-                let inner = Self::shape_of_block(nt, a);
+                let inner = self.shape_of_block(nt, a, path);
                 match nt["nesting_mode"].as_str().unwrap_or("single") {
                     "single" => inner,
                     "map" => Ty::Map(Box::new(inner), a),
@@ -641,8 +700,8 @@ impl Infer {
         }
     }
 
-    fn shape_of_block_type(bt: &J, a: u32) -> Ty {
-        let inner = Self::shape_of_block(&bt["block"], a);
+    fn shape_of_block_type(&mut self, bt: &J, a: u32, path: &str) -> Ty {
+        let inner = self.shape_of_block(&bt["block"], a, &format!("{}[]", path));
         match bt["nesting_mode"].as_str().unwrap_or("list") {
             "single" | "group" => inner,
             "map" => Ty::Map(Box::new(inner), a),
@@ -654,15 +713,16 @@ impl Infer {
     /// after apply. With `desc`, a source node is made for the read.
     fn res_attr(&mut self, ty: &str, data: bool, k: &str, desc: Option<String>) -> Option<Ty> {
         let block = self.blocks.get(&(ty.to_string(), data))?.clone()?;
+        let path = desc.as_deref().map(|d| d.trim_matches('`').to_string()).unwrap_or_else(|| format!("{}.{}", ty, k));
         let a = match desc {
             Some(d) => self.src(d),
             None => self.ann(),
         };
         if let Some(x) = block["attributes"].get(k) {
-            return Some(Self::shape_of_attr(x, a));
+            return Some(self.shape_of_attr(x, a, &path));
         }
         if let Some(bt) = block["block_types"].get(k) {
-            return Some(Self::shape_of_block_type(bt, a));
+            return Some(self.shape_of_block_type(bt, a, &path));
         }
         None
     }
@@ -1171,7 +1231,8 @@ impl Infer {
                 "count-deferred" => {
                     // The condition is evaluated by the engine: no stage requirement.
                     if let Some(c) = items.get(1) {
-                        self.infer(c);
+                        let t = self.infer(c);
+                        self.secret_sink(&t, "K0320", "`count` depends on a secret; Terraform rejects sensitive values here".into(), "");
                     }
                     self.inst_frames.push(1);
                     let r = self.body(&items[2.min(items.len())..]);
@@ -1183,7 +1244,8 @@ impl Infer {
                         Some(Value::Vector(b)) if b.len() == 2 => (b[0].clone(), b[1].clone()),
                         _ => return self.dyn_(),
                     };
-                    self.infer(&coll);
+                    let ct = self.infer(&coll);
+                    self.secret_sink(&ct, "K0320", "`for_each` depends on a secret; Terraform rejects sensitive values here".into(), "");
                     self.inst_frames.push(2);
                     let r = self.scoped(|me| {
                         match &pat {
@@ -1208,23 +1270,45 @@ impl Infer {
                 }
                 "data" => {
                     let ty = items.get(1).and_then(|c| c.sym_name()).and_then(|c| self.ctors.get(c).cloned());
-                    let name = self.declaration(&items[2.min(items.len())..]);
+                    let name = self.declaration(&items[2.min(items.len())..], ty.as_ref().map(|t| (t.as_str(), true)));
                     return match ty {
                         Some(t) => Ty::Res(t, true, name, self.inst_kind()),
                         None => self.dyn_(),
                     };
                 }
                 "module" => {
-                    self.declaration(&items[1..]);
+                    self.declaration(&items[1..], None);
                     return Ty::Module;
                 }
                 "output" => {
-                    if let Some(n) = items.get(1) {
-                        let t = self.infer(n);
-                        self.sink(&t, K0314);
-                    }
-                    for a in &items[2.min(items.len())..] {
+                    let name = match items.get(1) {
+                        Some(n) => {
+                            let t = self.infer(n);
+                            self.sink(&t, K0314);
+                            match n {
+                                Value::Str(s) => s.to_string(),
+                                _ => "this".into(),
+                            }
+                        }
+                        None => "this".into(),
+                    };
+                    let v = items.get(2).map(|f| self.infer(f));
+                    for a in &items[3.min(items.len())..] {
                         self.infer(a);
+                    }
+                    let sensitive = match items.get(3) {
+                        Some(Value::Map(m)) => m.iter().any(|(k, v)| {
+                            matches!(k, Value::Keyword(x) if &**x == "sensitive") && matches!(v, Value::Bool(true))
+                        }),
+                        _ => false,
+                    };
+                    if let (Some(v), false) = (v, sensitive) {
+                        self.secret_sink(
+                            &v,
+                            "K0321",
+                            format!("output `{}` exposes a secret", name),
+                            "mark the output sensitive: (output \"name\" value {:sensitive true})",
+                        );
                     }
                     return Ty::Nil;
                 }
@@ -1241,17 +1325,33 @@ impl Infer {
         if let Some(sym) = items[0].sym_name() {
             if sym.contains('/') && !self.shadowed(sym) {
                 if let Some(f) = sym.strip_prefix("tf/") {
-                    for a in &items[1..] {
-                        self.infer(a);
+                    let ts: Vec<Ty> = items[1..].iter().map(|a| self.infer(a)).collect();
+                    let s = if f == "expr" || f == "if" || f == "and" || f == "or" {
+                        self.src(format!("the Terraform expression at line {}", self.line()))
+                    } else {
+                        self.src(format!("the result of the Terraform function `{}`", f))
+                    };
+                    // The result is known after apply (the source), and what goes into
+                    // a Terraform function comes out of it, secrets included, unless
+                    // the function is Terraform's own declassification.
+                    let r = self.ann();
+                    self.g.edge(s, r);
+                    if f != "nonsensitive" {
+                        for t in &ts {
+                            let mut anns = vec![];
+                            self.all_anns(t, &mut anns);
+                            if anns.is_empty() && matches!(self.resolve(t), Ty::Var(_)) {
+                                anns.push(self.stage(t));
+                            }
+                            for a in anns {
+                                self.g.edge(a, r);
+                            }
+                        }
                     }
-                    if f == "expr" || f == "if" || f == "and" || f == "or" {
-                        let s = self.src(format!("the Terraform expression at line {}", self.line()));
-                        return Ty::Dyn(s);
-                    }
-                    let s = self.src(format!("the result of the Terraform function `{}`", f));
-                    return Ty::Dyn(s);
+                    return Ty::Dyn(r);
                 }
-                let name = self.declaration(&items[1..]);
+                let ctor = self.ctors.get(sym).cloned();
+                let name = self.declaration(&items[1..], ctor.as_ref().map(|t| (t.as_str(), false)));
                 return match self.ctors.get(sym).cloned() {
                     Some(t) => Ty::Res(t, false, name, self.inst_kind()),
                     None => self.dyn_(),
@@ -1289,8 +1389,9 @@ impl Infer {
     }
 
     /// A declaration: its name must be known at compile time, and it is an
-    /// effect. Returns the address name when it is a literal at top level.
-    fn declaration(&mut self, args: &[Value]) -> Option<Rc<str>> {
+    /// effect. With a known resource type, its arguments are checked against
+    /// the schema. Returns the address name when it is a literal at top level.
+    fn declaration(&mut self, args: &[Value], ctor: Option<(&str, bool)>) -> Option<Rc<str>> {
         let literal = match args.first() {
             Some(Value::Str(s)) if self.scope_depth == 0 => Some(s.clone()),
             _ => None,
@@ -1299,11 +1400,171 @@ impl Infer {
             let t = self.infer(n);
             self.sink(&t, K0314);
         }
-        for a in args.iter().skip(1) {
-            self.infer(a);
+        let mut body = None;
+        for (i, a) in args.iter().enumerate().skip(1) {
+            let t = self.infer(a);
+            if i == 1 {
+                body = Some(t);
+            }
         }
         self.emit_decl();
+        if let (Some((ty, data)), Some(body)) = (ctor, body) {
+            if let Some(Some(block)) = self.blocks.get(&(ty.to_string(), data)).cloned() {
+                let what = match &literal {
+                    Some(n) => format!("{}{}.{}", if data { "data." } else { "" }, ty, n),
+                    None => format!("{}{}", if data { "data " } else { "" }, ty),
+                };
+                let meta: &[&str] = if data { DATA_META } else { RESOURCE_META };
+                self.check_args(&block, &body, &what, "", meta);
+            }
+        }
         literal
+    }
+
+    fn arg_error(&mut self, code: &'static str, what: &str, msg: String, help: Option<String>, stage: Option<u32>) {
+        let pos = self.pos.last().copied();
+        let e = StageError { code, msg: format!("{}: {}", what, msg), help: help.unwrap_or_default(), pos };
+        match stage {
+            Some(a) => self.typed.push((a, e)),
+            None => {
+                if !self.errors.iter().any(|x| x.code == e.code && x.pos == e.pos && x.msg == e.msg) {
+                    self.errors.push(e)
+                }
+            }
+        }
+    }
+
+    /// Check an argument map's type against a schema block, before evaluation.
+    /// Only what is certain is reported: a field whose type is `?` or not yet
+    /// known passes, and an open record is not checked for completeness.
+    fn check_args(&mut self, block: &J, t: &Ty, what: &str, path: &str, meta: &[&str]) {
+        let (fields, closed) = match self.resolve(t) {
+            Ty::Rec(f, tail, _) => (f, tail == Tail::Closed),
+            Ty::Vec(e, _) => {
+                // a list or set block given as a vector of maps
+                return self.check_args(block, &e, what, path, meta);
+            }
+            _ => return,
+        };
+        let empty = serde_json::Map::new();
+        let attrs = block["attributes"].as_object().unwrap_or(&empty).clone();
+        let blocks = block["block_types"].as_object().unwrap_or(&empty).clone();
+        let join = |k: &str| if path.is_empty() { k.to_string() } else { format!("{}.{}", path, k) };
+        for (k, (ft, _opt)) in &fields {
+            let p = join(k);
+            if meta.contains(&k.as_str()) {
+                if k == "count" || k == "for_each" {
+                    let msg = format!("`{}` depends on a secret; Terraform rejects sensitive values here", p);
+                    self.secret_sink(ft, "K0320", format!("{}: {}", what, msg), "");
+                }
+                continue;
+            }
+            if let Some(a) = attrs.get(k) {
+                let flag = |x: &str| a[x] == J::Bool(true);
+                if flag("computed") && !flag("optional") && !flag("required") {
+                    self.arg_error(
+                        "K0703",
+                        what,
+                        format!("`{}` is read-only; the provider computes it", p),
+                        Some("read it from the resource instead, e.g. (:attr resource)".into()),
+                        None,
+                    );
+                    continue;
+                }
+                if !flag("sensitive") && !flag("write_only") {
+                    let msg = format!("{}: `{}` is not sensitive, but its value comes from a secret", what, p);
+                    match a.get("nested_type") {
+                        Some(nt) => {
+                            let nt = nt.clone();
+                            self.check_args(&nt, ft, what, &p, &[]);
+                        }
+                        None => self.secret_sink(ft, "K0320", msg, "if exposing it is intended, say so with (tf/nonsensitive x)"),
+                    }
+                }
+                if let Some(ty) = a.get("type").cloned() {
+                    self.check_type(&ty, ft, what, &p);
+                }
+            } else if let Some(bt) = blocks.get(k) {
+                let ft_r = self.resolve(ft);
+                let mode = bt["nesting_mode"].as_str().unwrap_or("list").to_string();
+                let ok = match (&ft_r, mode.as_str()) {
+                    (Ty::Rec(..), _) => true,
+                    (Ty::Vec(..), "list" | "set") => true,
+                    (Ty::Map(..), "map") => true,
+                    (Ty::Var(_) | Ty::Dyn(_) | Ty::Nil, _) => true,
+                    _ => false,
+                };
+                if !ok {
+                    let shown = self.show(&ft_r);
+                    self.arg_error(
+                        "K0705",
+                        what,
+                        format!("`{}` is a nested block and must be a map, got {}", p, shown),
+                        None,
+                        None,
+                    );
+                    continue;
+                }
+                let inner = bt["block"].clone();
+                self.check_args(&inner, ft, what, &p, &[]);
+            } else if closed {
+                let names: Vec<&str> =
+                    attrs.keys().chain(blocks.keys()).map(|s| s.as_str()).chain(meta.iter().copied()).collect();
+                let help = crate::check::suggest(k, names).map(|s| format!("did you mean `{}`?", s));
+                self.arg_error("K0701", what, format!("unknown argument `{}`", p), help, None);
+            }
+        }
+        if closed {
+            for (k, a) in &attrs {
+                if a["required"] == J::Bool(true) && !fields.contains_key(k) {
+                    self.arg_error("K0702", what, format!("missing required argument `{}`", join(k)), None, None);
+                }
+            }
+            for (k, bt) in &blocks {
+                let min = bt["min_items"].as_u64().unwrap_or(0);
+                if min > 0 && !fields.contains_key(k) {
+                    self.arg_error(
+                        "K0702",
+                        what,
+                        format!("missing required block `{}` (at least {})", join(k), min),
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A definite type mismatch between a schema type and an inferred one.
+    /// Values known only after apply pass, as in the evaluator's check, so
+    /// the error waits until the stage of the value is known.
+    fn check_type(&mut self, ty: &J, t: &Ty, what: &str, path: &str) {
+        let r = self.resolve(t);
+        let wrong = match (ty, &r) {
+            (_, Ty::Var(_) | Ty::Dyn(_) | Ty::Nil) => false,
+            (J::String(x), Ty::P(p, _)) => match x.as_str() {
+                "number" => *p != Prim::Num,
+                "bool" => *p != Prim::Bool,
+                _ => false,
+            },
+            (J::String(x), Ty::Vec(..) | Ty::Map(..) | Ty::Rec(..)) => x == "string" || x == "number" || x == "bool",
+            (J::Array(a), Ty::P(..)) => matches!(a.first().and_then(|k| k.as_str()), Some("list" | "set" | "map" | "object")),
+            _ => false,
+        };
+        if wrong {
+            let expected = match ty {
+                J::String(x) => x.clone(),
+                J::Array(a) => format!(
+                    "{}({})",
+                    a.first().and_then(|k| k.as_str()).unwrap_or("?"),
+                    a.get(1).map(|t| t.to_string().replace('"', "")).unwrap_or_default()
+                ),
+                _ => "?".into(),
+            };
+            let shown = self.show(&r);
+            let stage = self.top(&r);
+            self.arg_error("K0704", what, format!("`{}` must be {}, got {}", path, expected, shown), None, stage);
+        }
     }
 
     fn apply(&mut self, f: &Ty, args: &[Ty], head: &Value) -> Ty {
@@ -1568,7 +1829,17 @@ impl Infer {
                 let s = self.prim(Prim::Str);
                 Ty::Vec(Box::new(s), self.ann())
             }
-            "identity" | "with-meta" | "secret" => arg(0),
+            "identity" | "with-meta" => arg(0),
+            "secret" => {
+                let t = arg(0);
+                let r = self.copy_fresh(&t);
+                self.flow(&t, &r);
+                let s = self.secret_src("a value marked with `secret`".into());
+                if let Some(top) = self.top(&r) {
+                    self.g.edge(s, top);
+                }
+                r
+            }
             _ => self.dyn_(),
         }
     }
@@ -1662,16 +1933,17 @@ impl Infer {
         let declares = self.g.reach(&[self.decl]);
         for p in std::mem::take(&mut self.pending) {
             if declares.contains_key(&p.branch) {
-                let s = self.g.add(Node::Sink { code: K0312.0, msg: K0312.1.into(), help: K0312.2, pos: p.pos });
+                let s = self.g.add(Node::Sink { code: K0312.0, msg: K0312.1.into(), help: K0312.2, pos: p.pos, secret: false });
                 self.g.edge(p.cond, s);
             }
         }
     }
 
-    /// Report every sink a source reaches, once.
+    /// Report every sink a source reaches, once, for each lattice: stage
+    /// sources (all of them) to stage sinks, secret sources to secret sinks.
     fn settle(&mut self) {
         self.conditionals();
-        let sources: Vec<u32> = self
+        let stage_sources: Vec<u32> = self
             .g
             .nodes
             .iter()
@@ -1679,10 +1951,33 @@ impl Infer {
             .filter(|(_, n)| matches!(n, Node::Src { .. }))
             .map(|(i, _)| i as u32)
             .collect();
-        let reached = self.g.reach(&sources);
+        let secret_sources: Vec<u32> = self
+            .g
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n, Node::Src { secret: true, .. }))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let staged = self.g.reach(&stage_sources);
+        // type mismatches stand only for values known at compile time
+        for (a, e) in std::mem::take(&mut self.typed) {
+            if !staged.contains_key(&a) && !self.errors.iter().any(|x| x.code == e.code && x.pos == e.pos && x.msg == e.msg) {
+                self.errors.push(e);
+            }
+        }
+        let secret = self.g.reach(&secret_sources);
+        self.report(&staged, false);
+        self.report(&secret, true);
+    }
+
+    fn report(&mut self, reached: &HashMap<u32, u32>, secret_lattice: bool) {
         let mut hits: Vec<(u32, u32)> = reached
             .iter()
-            .filter(|(n, _)| matches!(self.g.nodes[**n as usize], Node::Sink { .. }) && !self.reported.contains(n))
+            .filter(|(n, _)| {
+                matches!(self.g.nodes[**n as usize], Node::Sink { secret, .. } if secret == secret_lattice)
+                    && !self.reported.contains(n)
+            })
             .map(|(n, o)| (*n, *o))
             .collect();
         let pos_of = |g: &Graph, n: u32| match &g.nodes[n as usize] {
@@ -1693,13 +1988,14 @@ impl Infer {
         let mut seen_sites = HashSet::new();
         for (sink, origin) in hits {
             self.reported.insert(sink);
-            if !self.blamed.insert(origin) {
+            // one stage error per cause, so a deferred list that is iterated does not
+            // also report every name made from it; every place a secret leaks counts
+            if !secret_lattice && !self.blamed.insert(origin) {
                 continue;
             }
-            if let (Node::Sink { code, msg, help, pos }, Node::Src { desc, pos: spos }) =
+            if let (Node::Sink { code, msg, help, pos, .. }, Node::Src { desc, pos: spos, .. }) =
                 (self.g.nodes[sink as usize].clone(), self.g.nodes[origin as usize].clone())
             {
-                // one report per place and kind
                 if !seen_sites.insert((code, pos.map(|p| (p.line, p.col)))) {
                     continue;
                 }
@@ -1707,12 +2003,12 @@ impl Infer {
                     continue;
                 }
                 let at = spos.map(|p| format!(" (line {}, column {})", p.line, p.col)).unwrap_or_default();
-                self.errors.push(StageError {
-                    code,
-                    msg: format!("{}: it depends on {}{}", msg, desc, at),
-                    help,
-                    pos,
-                });
+                let msg = if secret_lattice {
+                    format!("{}: the secret is {}{}", msg, desc, at)
+                } else {
+                    format!("{}: it depends on {}{}", msg, desc, at)
+                };
+                self.errors.push(StageError { code, msg, help: help.to_string(), pos });
             }
         }
     }

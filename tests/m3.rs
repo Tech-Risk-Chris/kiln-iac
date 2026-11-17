@@ -532,3 +532,91 @@ fn a_secret_cannot_decide_count() {
     let e = err(&format!("{}{}", SETUP, r#"(count-deferred (tf/length key) (g/compute_network "n" {:name "n"}))"#));
     assert!(e.contains("K0320") && e.contains("`count` depends on the secret"), "{}", e);
 }
+
+// ------------------------------------------------------------------ step 5: schema and secrets before evaluation
+
+/// Schema mistakes inside a function nobody calls: found anyway.
+const UNRUN_SCHEMA: &[(&str, &str, &str)] = &[
+    (r#"(g/compute_network "n" {:name "n" :descripton "x"})"#, "K0701", "did you mean `description`?"),
+    (r#"(g/compute_network "n" {:auto_create_subnetworks false})"#, "K0702", "missing required argument `name`"),
+    (r#"(g/compute_network "n" {:name "n" :self_link "x"})"#, "K0703", "`self_link` is read-only"),
+    (r#"(g/compute_network "n" {:name "n" :mtu "1460"})"#, "K0704", "`mtu` must be number"),
+    (r#"(g/compute_network "n" {:name "n" :auto_create_subnetworks "true"})"#, "K0704", "must be bool"),
+    (r#"(g/container_node_pool "p" {:cluster "c" :node_config {:machine_typ "e2"}})"#, "K0701", "`node_config.machine_typ`"),
+    (r#"(g/container_node_pool "p" {:cluster "c" :node_config {:oauth_scopes "x"}})"#, "K0704", "`node_config.oauth_scopes` must be set(string)"),
+    (r#"(g/container_node_pool "p" {:cluster "c" :autoscaling 5})"#, "K0705", "is a nested block"),
+    (r#"(g/compute_firewall "f" {:name "f" :network "n" :allow {:ports ["80"]}})"#, "K0702", "`allow.protocol`"),
+    (r#"(data g/client_config "me" {:nope 1})"#, "K0701", "unknown argument `nope`"),
+];
+
+#[test]
+fn schema_mistakes_are_found_in_code_that_never_runs() {
+    let mut missed = vec![];
+    for (snippet, code, text) in UNRUN_SCHEMA {
+        let errs = stage_errors(&format!("(defn never [] {})", snippet));
+        if !errs.iter().any(|e| e.contains(&format!("error[{}]", code)) && e.contains(text)) {
+            missed.push(format!("{}\n  want {} with {:?}, got:\n{}", snippet, code, text, errs.join("\n")));
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
+}
+
+#[test]
+fn values_known_after_apply_pass_the_static_type_check() {
+    // a string attribute into a number argument: the engine converts; the evaluator lets it pass too
+    let errs = stage_errors(&format!("{}{}", CLUSTER, r#"(defn never [] (g/compute_network "n" {:name "n" :mtu (:name c)}))"#));
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
+fn incomplete_maps_are_not_judged_for_completeness() {
+    // a map built from a parameter: fields present are checked, missing ones are not guessed
+    let errs = stage_errors(r#"(defn mk [extra] (g/compute_network "n" (merge {:mtu 1460} extra)))"#);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    let errs = stage_errors(r#"(defn mk [cfg] (g/compute_network "n" {:name (:name cfg) :mtu (:mtu cfg)}))"#);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
+fn evaluated_mistakes_are_reported_once_with_the_address() {
+    let src = format!("{}(g/compute_network \"n\" {{:name \"n\" :descripton \"x\"}})\n", G);
+    let schemas = Rc::new(SchemaSet::from_dir(".kiln/schemas".into()));
+    let e = build(&src, "t.kiln", &BuildOpts { schemas: Some(schemas), ..BuildOpts::default() }).err().unwrap();
+    assert_eq!(e.matches("error[K0701]").count(), 1, "{}", e);
+    assert!(e.contains("google_compute_network.n: unknown argument"), "{}", e);
+}
+
+/// Secrets leaking in code that never runs.
+const UNRUN_SECRETS: &[(&str, &str, &str)] = &[
+    (r#"(defn never [] (g/compute_network "n" {:name "n" :description (str "t=" (:access_token me))}))"#, "K0320", "`description` is not sensitive"),
+    (r#"(defn never [] (g/container_node_pool "p" {:cluster "c" :node_config {:labels {:k key}}}))"#, "K0320", "`node_config.labels` is not sensitive"),
+    (r#"(defn never [] (output "k" key))"#, "K0321", "output `k` exposes a secret"),
+    (r#"(defn wrap [x] (tf/upper x)) (defn never [] (g/compute_network "n" {:name "n" :description (wrap key)}))"#, "K0320", "client_key"),
+    (r#"(defn never [] (count-deferred (tf/length key) (g/compute_network "n" {:name "n"})))"#, "K0320", "`count` depends on a secret"),
+    (r#"(defn never [] (g/compute_network "n" {:name "n" :description (secret (tf/expr "var.t"))}))"#, "K0320", "marked with `secret`"),
+];
+
+#[test]
+fn secrets_are_tracked_in_code_that_never_runs() {
+    let mut missed = vec![];
+    for (snippet, code, text) in UNRUN_SECRETS {
+        let errs = stage_errors(&format!("{}{}", SETUP, snippet));
+        if !errs.iter().any(|e| e.contains(&format!("error[{}]", code)) && e.contains(text)) {
+            missed.push(format!("{}\n  want {} with {:?}, got:\n{}", snippet, code, text, errs.join("\n")));
+        }
+    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
+}
+
+#[test]
+fn secrets_may_go_where_they_belong_statically_too() {
+    let errs = stage_errors(&format!(
+        "{}{}",
+        SETUP,
+        r#"(defn ok [] (g/secret_manager_secret_version "v" {:secret "s" :secret_data (str "t=" (:access_token me))}))
+           (defn ok2 [] (output "k" key {:sensitive true}))
+           (defn ok3 [] (g/compute_network "n" {:name "n" :description (tf/nonsensitive key)}))
+           (defn ok4 [] (g/compute_network "n" {:name "n" :description (:cluster_ca_certificate (get (:master_auth c) 0))}))"#
+    ));
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}

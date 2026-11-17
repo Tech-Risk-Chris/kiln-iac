@@ -2,6 +2,7 @@
 
 pub mod builtins;
 pub mod check;
+pub mod codes;
 pub mod emit;
 pub mod eval;
 pub mod import;
@@ -78,7 +79,8 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
     // Where evaluation stopped on the same problem at the same place, its
     // message names the exact address, so it wins.
     for e in &ty.errors {
-        let same = fatal.as_ref().map_or(false, |f| f.code == e.code && f.pos == e.pos);
+        let same = fatal.as_ref().map_or(false, |f| f.code == e.code && f.pos == e.pos)
+            || it.diags.iter().any(|d| d.code == e.code && d.pos == e.pos);
         if !same {
             errors.push(stage_error(e).render(file, src));
         }
@@ -121,7 +123,7 @@ pub fn build(src: &str, file: &str, opts: &BuildOpts) -> Result<Build, String> {
 }
 
 fn stage_error(e: &infer::StageError) -> KilnError {
-    KilnError { code: e.code, msg: e.msg.clone(), pos: e.pos, help: Some(e.help.to_string()) }
+    KilnError { code: e.code, msg: e.msg.clone(), pos: e.pos, help: if e.help.is_empty() { None } else { Some(e.help.clone()) } }
 }
 
 fn render_clashes(ty: &infer::Infer, file: &str, src: &str) -> Vec<String> {
