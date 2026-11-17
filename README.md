@@ -4,7 +4,7 @@ A Lisp that compiles to Terraform JSON. Terraform or OpenTofu stays the engine
 (providers, plan, apply, state); Kiln replaces HCL and Terragrunt as the thing
 you write. The generated `main.tf.json` has no dependency on Kiln.
 
-Design document: *Kiln: a typed Lisp that compiles to Terraform*.
+Design: [DESIGN.md](DESIGN.md). Milestones and status: [ROADMAP.md](ROADMAP.md).
 
 ## Status: M2
 
